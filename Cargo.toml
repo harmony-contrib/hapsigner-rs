@@ -1,0 +1,33 @@
+[package]
+name = "hapsigner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Java-free OpenHarmony HAP signer for development and QEMU"
+license = "MIT"
+repository = "https://github.com/ohos-rs/hapsigner-rs"
+keywords = ["openharmony", "ohos", "hap", "signing"]
+categories = ["command-line-utilities", "cryptography"]
+
+[[bin]]
+name = "hap-sign"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+cms = { version = "0.2.3", features = ["builder"] }
+const-oid = { version = "0.9.6", features = ["db"] }
+der = { version = "0.7.10", features = ["pem"] }
+p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = { version = "0.10.9", features = ["oid"] }
+spki = "0.7.3"
+tempfile = "3.20"
+uuid = { version = "1.17", features = ["v4"] }
+x509-cert = { version = "0.2.5", features = ["pem"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
