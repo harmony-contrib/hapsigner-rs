@@ -1,11 +1,17 @@
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use hapsigner::{
-    default_output_path, embedded_profile, sign_file, signing_block_info, SignOptions,
+    DevelopmentProfileOptions, DevelopmentSigner, FileSigningMaterial, HapSigner, SignOptions,
+    SigningAlgorithm, SigningBlockInspector,
 };
+
+const STORE_PASSWORD_ENV: &str = "HAPSIGNER_STORE_PASSWORD";
+const KEY_PASSWORD_ENV: &str = "HAPSIGNER_KEY_PASSWORD";
 
 #[derive(Parser, Debug)]
 #[command(name = "hap-sign", version, about = "Java-free OpenHarmony HAP signer")]
@@ -16,49 +22,100 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Sign an unsigned HAP or replace its existing signing block.
+    /// Sign with the embedded public development identity for QEMU/local use.
     Sign {
-        /// Input HAP file.
         input: PathBuf,
-        /// Output HAP file (defaults to <input>-signed.hap).
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Bundle name from AppScope/app.json5.
         #[arg(long)]
         bundle_name: String,
-        /// Application privilege level.
         #[arg(long, default_value = "normal")]
         apl: String,
-        /// Application feature recorded in the provisioning profile.
         #[arg(long, value_enum, default_value_t = AppFeature::Normal)]
         app_feature: AppFeature,
-        /// Add an allowed ACL to the provisioning profile; may be repeated.
         #[arg(long = "acl")]
         allowed_acls: Vec<String>,
-        /// Add a restricted permission to the profile; may be repeated.
         #[arg(long = "restricted-permission")]
         restricted_permissions: Vec<String>,
-        /// Authorize a device UDID; may be repeated. QEMU developer images accept the default marker.
         #[arg(long = "device-id", default_value = "*")]
         device_ids: Vec<String>,
-        /// Profile lifetime in days (maximum 3650).
         #[arg(long, default_value_t = 3650)]
         valid_days: u64,
-        /// Replace an existing output file.
+        #[arg(long, default_value_t = 9)]
+        compatible_version: u32,
+        #[arg(long)]
+        no_code_signing: bool,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Sign with caller-provided Hvigor-compatible PKCS#12 material.
+    SignWithMaterial {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        keystore: PathBuf,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        certificate: PathBuf,
+        #[arg(long)]
+        key_alias: String,
+        #[arg(long, default_value = "SHA256withECDSA")]
+        sign_alg: String,
+        #[arg(long, default_value_t = 9)]
+        compatible_version: u32,
+        #[arg(long)]
+        no_code_signing: bool,
         #[arg(long)]
         force: bool,
     },
     /// Print signing-block metadata and the embedded provisioning profile.
-    Inspect {
-        /// Signed HAP file.
-        input: PathBuf,
-    },
+    Inspect { input: PathBuf },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum AppFeature {
     Normal,
     System,
+}
+
+struct OutputPolicy {
+    force: bool,
+}
+
+impl OutputPolicy {
+    fn validate(&self, output: &Path) -> Result<()> {
+        if output
+            .try_exists()
+            .with_context(|| format!("failed to inspect output path {}", output.display()))?
+            && !self.force
+        {
+            bail!(
+                "output already exists (pass --force to replace it): {}",
+                output.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+struct EnvironmentPasswords {
+    store: String,
+    key: String,
+}
+
+impl EnvironmentPasswords {
+    fn load() -> Result<Self> {
+        Ok(Self {
+            store: Self::required(STORE_PASSWORD_ENV)?,
+            key: Self::required(KEY_PASSWORD_ENV)?,
+        })
+    }
+
+    fn required(name: &str) -> Result<String> {
+        std::env::var(name).with_context(|| format!("{name} must be set for sign-with-material"))
+    }
 }
 
 impl AppFeature {
@@ -82,37 +139,99 @@ fn main() -> Result<()> {
             restricted_permissions,
             device_ids,
             valid_days,
+            compatible_version,
+            no_code_signing,
             force,
         } => {
-            let output = output.unwrap_or_else(|| default_output_path(&input));
-            let options = SignOptions {
-                bundle_name,
-                apl,
-                app_feature: app_feature.profile_value().into(),
-                allowed_acls,
-                restricted_permissions,
-                device_ids,
-                valid_days,
+            let output = output.unwrap_or_else(|| signed_output_path(&input));
+            OutputPolicy { force }.validate(&output)?;
+            let signer = DevelopmentSigner::new(
+                DevelopmentProfileOptions {
+                    bundle_name,
+                    apl,
+                    app_feature: app_feature.profile_value().into(),
+                    allowed_acls,
+                    restricted_permissions,
+                    device_ids,
+                    valid_days,
+                },
+                SignOptions {
+                    compatible_version,
+                    code_signing: !no_code_signing,
+                },
+            )?;
+            signer.sign_file(&input, &output)?;
+            println!("{}", output.display());
+        }
+        Command::SignWithMaterial {
+            input,
+            output,
+            keystore,
+            profile,
+            certificate,
+            key_alias,
+            sign_alg,
+            compatible_version,
+            no_code_signing,
+            force,
+        } => {
+            let output = output.unwrap_or_else(|| signed_output_path(&input));
+            OutputPolicy { force }.validate(&output)?;
+            let passwords = EnvironmentPasswords::load()?;
+            let material = FileSigningMaterial {
+                keystore_path: keystore,
+                profile_path: profile,
+                certificate_path: certificate,
+                key_alias: key_alias.into(),
+                store_password: passwords.store.into(),
+                key_password: passwords.key.into(),
+                algorithm: SigningAlgorithm::from_str(&sign_alg)?,
             };
-            sign_file(&input, &output, &options, force)?;
+            HapSigner::new(
+                material.load()?,
+                SignOptions {
+                    compatible_version,
+                    code_signing: !no_code_signing,
+                },
+            )
+            .sign_file(&input, &output)?;
             println!("{}", output.display());
         }
         Command::Inspect { input } => {
             let data =
                 fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
-            let info = signing_block_info(&data)?;
-            let profile = embedded_profile(&data)?;
+            let inspector = SigningBlockInspector::new(&data);
+            let info = inspector.inspect()?;
             println!(
                 "signing-block: version={}, size={}, sub-blocks={}",
                 info.version,
                 info.size,
                 info.blocks.len()
             );
-            for (block_type, offset, length) in &info.blocks {
-                println!("sub-block: type=0x{block_type:08x}, offset={offset}, length={length}");
+            for block in &info.blocks {
+                println!(
+                    "sub-block: type=0x{:08x}, offset={}, length={}",
+                    block.block_type, block.offset, block.length
+                );
             }
-            println!("{}", serde_json::to_string_pretty(&profile)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inspector.embedded_profile()?)?
+            );
         }
     }
     Ok(())
+}
+
+fn signed_output_path(input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .unwrap_or_else(|| OsStr::new("application"));
+    let mut file_name = OsString::from(stem);
+    file_name.push("-signed");
+    if let Some(extension) = input.extension().filter(|value| !value.is_empty()) {
+        file_name.push(".");
+        file_name.push(extension);
+    }
+    input.with_file_name(file_name)
 }

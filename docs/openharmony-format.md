@@ -13,6 +13,17 @@ The corresponding upstream repositories are:
 - <https://gitee.com/openharmony/developtools_hapsigner>
 - <https://gitee.com/openharmony/security_appverify>
 
+The caller-facing material model was also compared with DevEco Studio
+6.1.1.280's readable Hvigor sources. In
+`tasks/sign/command-builder-impl/hap-sign-command-builder.ts`,
+`HapSignCommandBuilder.initCommandParams` invokes `sign-app -mode localSign`
+and forwards `keystoreFile`, store password, `keyAlias`, key password,
+`signAlg`, signed `profileFile`, `appCertFile`, input, and output. The tool path
+comes from the selected SDK toolchains component's `hap-sign-tool.jar`, not a
+fixed installation directory. `SigningMaterial` and `Pkcs12Material` model
+those material inputs without copying Hvigor's project or SDK discovery into
+the signing library.
+
 ## CMS/PKCS#7
 
 `BcPkcs7Generator.generateSignedData` and the C++ `PKCS7Data::Pkcs7Sign`
@@ -39,7 +50,8 @@ u32 digest_length = 32
 u8  digest[32]
 ```
 
-The `block_length` excludes its own four-byte field.
+The `block_length` excludes its own four-byte field. The algorithm identifier
+is `0x201` for ECDSA P-256/SHA-256 and `0x101` for RSA-PSS/SHA-256.
 
 ## HAP content digest
 
@@ -52,11 +64,36 @@ block.
 
 ## Signing block
 
-The v3 block contains 12-byte little-endian type/length/offset entries, their
-values, the block count, total size, `<hap sign block>`, and version `3`. This
-tool emits profile block `0x20000002` followed by main signature block
-`0x20000000`.
+The signing block contains 12-byte little-endian type/length/offset entries,
+their values, the block count, total size, magic, and version. Compatible
+versions below 8 select V2 (`HAP Sig Block 42`, version 2); version 8 and newer
+select V3 (`<hap sign block>`, version 3).
 
-The implementation is regression-tested against these layouts and was accepted
-by the `v20260809` QEMU image (`OpenHarmony 7.0.0.32`) for both a normal HAP and
-a HAP declaring a VPN extension.
+With code signing enabled, the block order is property `0x20000003`, profile
+`0x20000002`, then main signature `0x20000000`. The property contains the
+`0x30000001` code-sign block. With code signing disabled, only profile and main
+signature are emitted.
+
+## Archive preparation and code signing
+
+Normal stored entries are aligned to 4 bytes; runnable `.abc` and `.so`
+entries are aligned to 4096 bytes. The generated `.pages.info` bitmap and
+fs-verity Merkle/sign-info structures follow the hapsigner layout. Native
+library code-sign records are computed in parallel but restored to archive
+order before serialization, keeping output deterministic.
+
+File-backed ABC/page-info and fs-verity inputs are fed incrementally. Merkle
+levels are retained only when the HAP code-sign block must serialize them;
+native-library root calculation keeps only the active levels. ELF segment
+discovery decodes one native library at a time because the object parser needs
+random access to that entry.
+
+HNP code signing is a separate upstream path and is not implemented here.
+Archives containing `hnp/*.hnp` fail with a typed error when code signing is
+requested.
+
+The implementation is regression-tested against these layouts and the
+development-signing adapter was accepted by the `v20260809` QEMU image
+(`OpenHarmony 7.0.0.32`) for both a normal HAP and a HAP declaring a VPN
+extension. PKCS#12 ECDSA/RSA material injection, V2/V3 selection, streaming
+file output, and typed unsupported boundaries have dedicated regression tests.

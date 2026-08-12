@@ -3,29 +3,56 @@ name = "hapsigner"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Java-free OpenHarmony HAP signer for development and QEMU"
+description = "Reusable Java-free OpenHarmony HAP signing library and development CLI"
 license = "MIT"
-repository = "https://github.com/ohos-rs/hapsigner-rs"
+repository = "https://github.com/harmony-contrib/hapsigner-rs"
 keywords = ["openharmony", "ohos", "hap", "signing"]
 categories = ["command-line-utilities", "cryptography"]
 
 [[bin]]
 name = "hap-sign"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:anyhow", "dep:clap", "development"]
+development = ["dep:uuid"]
 
 [dependencies]
-anyhow = "1.0"
-clap = { version = "4.5", features = ["derive"] }
+anyhow = { version = "1.0", optional = true }
+bytes = "1"
+clap = { version = "4.5", features = ["derive"], optional = true }
 cms = { version = "0.2.3", features = ["builder"] }
 const-oid = { version = "0.9.6", features = ["db"] }
+crc32fast = "1"
 der = { version = "0.7.10", features = ["pem"] }
+flate2 = "1"
+fs-err = "3"
+object = "0.37"
+p12 = "0.6"
 p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
+pkcs12 = "0.1"
+pkcs5 = { version = "0.7", features = ["pbes2"] }
+pkcs8 = { version = "0.10", features = ["alloc", "pkcs5"] }
+rand = "0.8"
+rayon = "1"
+ring = "0.17"
+rsa = { version = "0.9", features = ["sha2", "pem"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sha2 = { version = "0.10.9", features = ["oid"] }
+signature = "2"
 spki = "0.7.3"
 tempfile = "3.20"
-uuid = { version = "1.17", features = ["v4"] }
+thiserror = "2"
+time = { version = "=0.3.44", features = ["local-offset"] }
+uuid = { version = "1.17", features = ["v4"], optional = true }
 x509-cert = { version = "0.2.5", features = ["pem"] }
+zeroize = "1"
+
+[dev-dependencies]
+base64 = "0.22"
+tracing = "0.1"
 
 [profile.release]
 codegen-units = 1

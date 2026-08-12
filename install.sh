@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${HAPSIGNER_REPO_URL:-https://github.com/ohos-rs/hapsigner-rs}"
+REPO_URL="${HAPSIGNER_REPO_URL:-https://github.com/harmony-contrib/hapsigner-rs}"
 VERSION="${HAPSIGNER_VERSION:-v0.1.0}"
 PREFIX="${HAPSIGNER_PREFIX:-${HOME}/.local}"
 DOWNLOAD_BASE_URL="${HAPSIGNER_DOWNLOAD_BASE_URL:-}"
@@ -19,7 +19,7 @@ Install the Java-free OpenHarmony HAP signer.
 Options:
   --prefix DIR       Install prefix. Default: $HOME/.local
   --version TAG      Release tag. Default: v0.1.0
-  --repo URL         Release repository. Default: https://github.com/ohos-rs/hapsigner-rs
+  --repo URL         Release repository. Default: https://github.com/harmony-contrib/hapsigner-rs
   --target TARGET    Rust host target, or auto
   --download-base-url URL
                      Download URL containing release assets
