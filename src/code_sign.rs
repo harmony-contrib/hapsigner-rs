@@ -984,10 +984,7 @@ impl MerkleTree {
         }
 
         let mut levels = vec![leaf];
-        loop {
-            let Some(level) = levels.last() else {
-                break;
-            };
+        while let Some(level) = levels.last() {
             if level.len() <= PAGE_SIZE {
                 break;
             }
