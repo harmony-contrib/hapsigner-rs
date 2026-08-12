@@ -1,55 +1,117 @@
+use base64::Engine;
+use der::{Decode, DecodePem};
+use x509_cert::Certificate;
+
 use crate::SignError;
 
-const OID_ID_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
-const OID_ID_SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
-
 pub(crate) struct ProfileContent {
-    json: String,
+    value: serde_json::Value,
 }
 
 impl ProfileContent {
+    pub(crate) fn from_profile(profile: &[u8], signed: bool) -> Result<Self, SignError> {
+        if signed {
+            Self::from_signed_profile(profile)
+        } else {
+            Self::from_json(profile)
+        }
+    }
+
     pub(crate) fn from_signed_profile(profile: &[u8]) -> Result<Self, SignError> {
-        let content = SignedProfileContentReader::new(profile).read_content()?;
-        let json = String::from_utf8(content)
-            .map_err(|e| SignError::Config(format!("profile content is not UTF-8 JSON: {e}")))?;
-        Ok(Self { json })
+        let verified = crate::pkcs7::verify_cms_signed_data(profile)?;
+        Self::from_json(&verified.content)
+    }
+
+    pub(crate) fn from_json(profile: &[u8]) -> Result<Self, SignError> {
+        let json = String::from_utf8(profile.to_vec()).map_err(|error| {
+            SignError::Config(format!("profile content is not UTF-8 JSON: {error}"))
+        })?;
+        let value = serde_json::from_str::<serde_json::Value>(&json).map_err(|error| {
+            SignError::Config(format!("profile content is not valid JSON: {error}"))
+        })?;
+        Ok(Self { value })
+    }
+
+    /// Mirrors `SignProvider.checkProfileValid`: application signing requires
+    /// a debug or release profile whose corresponding embedded application
+    /// certificate has a non-empty common name. ACLs are intentionally not
+    /// evaluated; the official development-signing path does not impose an ACL
+    /// policy.
+    pub(crate) fn validate_for_application_signing(&self) -> Result<(), SignError> {
+        let profile_type = self
+            .value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| SignError::Config("profile type is missing".to_owned()))?;
+        let certificate_field = if profile_type.eq_ignore_ascii_case("debug") {
+            "development-certificate"
+        } else if profile_type.eq_ignore_ascii_case("release") {
+            "distribution-certificate"
+        } else {
+            return Err(SignError::Config(format!(
+                "unsupported profile type: {profile_type}"
+            )));
+        };
+        let encoded_certificate = self
+            .value
+            .get("bundle-info")
+            .and_then(|bundle_info| bundle_info.get(certificate_field))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| SignError::Config(format!("profile {certificate_field} is missing")))?;
+        let certificate = Self::decode_profile_certificate(encoded_certificate)?;
+        let has_common_name = certificate
+            .tbs_certificate
+            .subject
+            .0
+            .iter()
+            .flat_map(|rdn| rdn.0.iter())
+            .find(|attribute| attribute.oid == const_oid::db::rfc4519::COMMON_NAME)
+            .map(|attribute| attribute.value.value())
+            .is_some_and(|value| !value.is_empty());
+        if !has_common_name {
+            return Err(SignError::Config(
+                "profile application certificate common name is empty".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn owner_id(&self) -> Result<Option<String>, SignError> {
-        let value: serde_json::Value = serde_json::from_str(&self.json)
-            .map_err(|e| SignError::Config(format!("profile content is not valid JSON: {e}")))?;
-        let profile_type = value
+        let profile_type = self
+            .value
             .get("type")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| SignError::Config("profile type is missing".to_string()))?;
-        match profile_type {
-            "debug" => Ok(Some("DEBUG_LIB_ID".to_string())),
-            "release" => {
-                let owner_id = value
-                    .get("bundle-info")
-                    .and_then(|bundle_info| bundle_info.get("app-identifier"))
-                    .and_then(serde_json::Value::as_str);
-                if let Some(owner_id) = owner_id {
-                    if owner_id.is_empty() || owner_id.len() > 32 {
-                        return Err(SignError::Config(
-                            "profile app-identifier length is invalid".to_string(),
-                        ));
-                    }
-                    Ok(Some(owner_id.to_string()))
-                } else {
-                    Ok(None)
-                }
-            }
-            _ => Err(SignError::Config(format!(
+        if profile_type.eq_ignore_ascii_case("debug") {
+            return Ok(Some("DEBUG_LIB_ID".to_owned()));
+        }
+        if !profile_type.eq_ignore_ascii_case("release") {
+            return Err(SignError::Config(format!(
                 "unsupported profile type for code signing: {profile_type}"
-            ))),
+            )));
+        }
+        let owner_id = self
+            .value
+            .get("bundle-info")
+            .and_then(|bundle_info| bundle_info.get("app-identifier"))
+            .and_then(serde_json::Value::as_str);
+        if let Some(owner_id) = owner_id {
+            if owner_id.is_empty() || owner_id.len() > 32 {
+                return Err(SignError::Config(
+                    "profile app-identifier length is invalid".to_string(),
+                ));
+            }
+            Ok(Some(owner_id.to_owned()))
+        } else {
+            Ok(None)
         }
     }
 
     pub(crate) fn plugin_id(&self) -> Result<String, SignError> {
-        let value: serde_json::Value = serde_json::from_str(&self.json)
-            .map_err(|e| SignError::Config(format!("profile content is not valid JSON: {e}")))?;
-        let plugin_id = value
+        let plugin_id = self
+            .value
             .get("app-services-capabilities")
             .and_then(|capabilities| capabilities.get("ohos.permission.kernel.SUPPORT_PLUGIN"))
             .and_then(|permission| permission.get("pluginDistributionIDs"))
@@ -64,156 +126,43 @@ impl ProfileContent {
         }
         Ok(plugin_id.to_string())
     }
-}
 
-struct SignedProfileContentReader<'a> {
-    profile: &'a [u8],
-}
-
-impl<'a> SignedProfileContentReader<'a> {
-    fn new(profile: &'a [u8]) -> Self {
-        Self { profile }
-    }
-
-    fn read_content(&self) -> Result<Vec<u8>, SignError> {
-        let mut reader = DerReader::new(self.profile);
-        let outer = reader.read_tlv()?;
-        reader.expect_end()?;
-        if outer.tag != 0x30 {
-            return Err(SignError::DerError(
-                "profile CMS ContentInfo is not a sequence".to_string(),
-            ));
-        }
-
-        let mut content_info = outer.reader();
-        content_info.expect_oid(OID_ID_SIGNED_DATA, "profile CMS signedData")?;
-        let signed_data_container =
-            content_info.expect_tag(0xa0, "profile CMS signedData content")?;
-        content_info.expect_end()?;
-
-        let mut signed_data_container = signed_data_container.reader();
-        let signed_data = signed_data_container.expect_tag(0x30, "profile CMS SignedData")?;
-        signed_data_container.expect_end()?;
-
-        let mut signed_data = signed_data.reader();
-        signed_data.expect_any("profile CMS SignedData version")?;
-        signed_data.expect_any("profile CMS digestAlgorithms")?;
-        let encap_content_info = signed_data.expect_tag(0x30, "profile CMS encapContentInfo")?;
-
-        let mut encap_content_info = encap_content_info.reader();
-        encap_content_info.expect_oid(OID_ID_DATA, "profile CMS eContent type")?;
-        let econtent = encap_content_info.expect_tag(0xa0, "profile CMS eContent")?;
-        encap_content_info.expect_end()?;
-
-        let mut econtent = econtent.reader();
-        let octets = econtent.expect_tag(0x04, "profile CMS eContent octet string")?;
-        econtent.expect_end()?;
-        Ok(octets.value.to_vec())
-    }
-}
-
-#[derive(Clone, Copy)]
-struct DerElement<'a> {
-    tag: u8,
-    value: &'a [u8],
-}
-
-impl<'a> DerElement<'a> {
-    fn reader(self) -> DerReader<'a> {
-        DerReader::new(self.value)
-    }
-}
-
-struct DerReader<'a> {
-    data: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> DerReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, offset: 0 }
-    }
-
-    fn read_tlv(&mut self) -> Result<DerElement<'a>, SignError> {
-        let tag = *self
-            .data
-            .get(self.offset)
-            .ok_or_else(|| SignError::DerError("unexpected end of DER data".to_string()))?;
-        self.offset += 1;
-        let len = self.read_len()?;
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or_else(|| SignError::DerError("DER length overflow".to_string()))?;
-        let value = self
-            .data
-            .get(self.offset..end)
-            .ok_or_else(|| SignError::DerError("DER value extends beyond input".to_string()))?;
-        self.offset = end;
-        Ok(DerElement { tag, value })
-    }
-
-    fn read_len(&mut self) -> Result<usize, SignError> {
-        let first = *self
-            .data
-            .get(self.offset)
-            .ok_or_else(|| SignError::DerError("unexpected end of DER length".to_string()))?;
-        self.offset += 1;
-        if first & 0x80 == 0 {
-            return Ok(first as usize);
-        }
-        let count = (first & 0x7f) as usize;
-        if count == 0 || count > std::mem::size_of::<usize>() {
-            return Err(SignError::DerError(
-                "unsupported DER length encoding".to_string(),
-            ));
-        }
-        let end = self
-            .offset
-            .checked_add(count)
-            .ok_or_else(|| SignError::DerError("DER length overflow".to_string()))?;
-        let bytes = self
-            .data
-            .get(self.offset..end)
-            .ok_or_else(|| SignError::DerError("DER length extends beyond input".to_string()))?;
-        self.offset = end;
-
-        let mut len = 0usize;
-        for byte in bytes {
-            len = (len << 8) | (*byte as usize);
-        }
-        Ok(len)
-    }
-
-    fn expect_tag(&mut self, tag: u8, context: &str) -> Result<DerElement<'a>, SignError> {
-        let element = self.read_tlv()?;
-        if element.tag != tag {
-            return Err(SignError::DerError(format!(
-                "{context} has unexpected DER tag 0x{:02x}",
-                element.tag
-            )));
-        }
-        Ok(element)
-    }
-
-    fn expect_any(&mut self, context: &str) -> Result<DerElement<'a>, SignError> {
-        self.read_tlv()
-            .map_err(|e| SignError::DerError(format!("{context}: {e}")))
-    }
-
-    fn expect_oid(&mut self, expected: &[u8], context: &str) -> Result<(), SignError> {
-        let element = self.expect_tag(0x06, context)?;
-        if element.value != expected {
-            return Err(SignError::DerError(format!("{context} OID mismatch")));
-        }
-        Ok(())
-    }
-
-    fn expect_end(&self) -> Result<(), SignError> {
-        if self.offset == self.data.len() {
-            Ok(())
+    pub(crate) fn public_hnp_owner_id(&self) -> Result<&'static str, SignError> {
+        let profile_type = self.profile_type()?;
+        if profile_type.eq_ignore_ascii_case("debug") {
+            Ok("DEBUG_LIB_ID")
+        } else if profile_type.eq_ignore_ascii_case("release") {
+            Ok("SHARED_LIB_ID")
         } else {
-            Err(SignError::DerError("trailing DER data".to_string()))
+            Err(SignError::Config(format!(
+                "unsupported profile type for public HNP: {profile_type}"
+            )))
         }
+    }
+
+    pub(crate) fn profile_type(&self) -> Result<&str, SignError> {
+        self.value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| SignError::Config("profile type is missing".to_owned()))
+    }
+
+    fn decode_profile_certificate(encoded: &str) -> Result<Certificate, SignError> {
+        if let Ok(certificate) = Certificate::from_pem(encoded) {
+            return Ok(certificate);
+        }
+        let compact = encoded.split_ascii_whitespace().collect::<String>();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(compact)
+            .map_err(|error| {
+                SignError::Config(format!(
+                    "profile application certificate is not Base64: {error}"
+                ))
+            })?;
+        Certificate::from_der(&der).map_err(|error| {
+            SignError::Config(format!(
+                "profile application certificate is invalid: {error}"
+            ))
+        })
     }
 }

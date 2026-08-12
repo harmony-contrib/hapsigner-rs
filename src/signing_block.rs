@@ -32,8 +32,16 @@ pub const MAGIC_V3: &[u8; 16] = b"<hap sign block>";
 
 /// ECDSA P-256 + SHA-256 (most common for HarmonyOS builds).
 pub const ALG_ECDSA_SHA256: u32 = 0x201;
+/// ECDSA + SHA-384.
+pub const ALG_ECDSA_SHA384: u32 = 0x202;
+/// ECDSA + SHA-512.
+pub const ALG_ECDSA_SHA512: u32 = 0x203;
 /// RSA-PSS + SHA-256.
 pub const ALG_RSA_PSS_SHA256: u32 = 0x101;
+/// RSA-PSS + SHA-384.
+pub const ALG_RSA_PSS_SHA384: u32 = 0x102;
+/// RSA-PSS + SHA-512.
+pub const ALG_RSA_PSS_SHA512: u32 = 0x103;
 
 // ---------------------------------------------------------------------------
 // Block assembly

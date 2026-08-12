@@ -250,7 +250,7 @@ pub struct HapZip {
 }
 
 pub(crate) struct PreparedSigningSections {
-    pub(crate) content_digest: [u8; 32],
+    pub(crate) content_digest: Vec<u8>,
     pub(crate) cd_bytes: Vec<u8>,
     pub(crate) entries_len: usize,
 }
@@ -733,26 +733,36 @@ impl HapZip {
     /// Compute the content digest for initial signing without materializing the
     /// local-entry section as one contiguous buffer.
     #[cfg(test)]
-    pub fn content_digest_for_signing(&self) -> Result<[u8; 32], SignError> {
+    pub fn content_digest_for_signing(&self) -> Result<Vec<u8>, SignError> {
         self.content_digest_for_signing_with_optional_blocks(&[])
     }
 
     /// Compute the content digest for initial signing, including HAP optional
     /// signing block values exactly as `HapUtils.computeDigests` does.
+    #[cfg(test)]
     pub fn content_digest_for_signing_with_optional_blocks(
         &self,
         optional_block_values: &[&[u8]],
-    ) -> Result<[u8; 32], SignError> {
+    ) -> Result<Vec<u8>, SignError> {
+        self.content_digest_for_signing_with_algorithm(
+            optional_block_values,
+            crate::ContentDigestAlgorithm::Sha256,
+        )
+    }
+
+    pub(crate) fn content_digest_for_signing_with_algorithm(
+        &self,
+        optional_block_values: &[&[u8]],
+        algorithm: crate::ContentDigestAlgorithm,
+    ) -> Result<Vec<u8>, SignError> {
         let (entry_offsets, entries_len) = self.entry_offsets();
         let cd_bytes = self.build_cd(&entry_offsets);
         let eocd_for_signing = self.build_eocd_for_signing(entries_len, &cd_bytes);
 
-        let mut digest = digest::HapDigestComputer::new(&[
-            entries_len,
-            0,
-            cd_bytes.len(),
-            eocd_for_signing.len(),
-        ]);
+        let mut digest = digest::HapDigestComputer::with_algorithm(
+            &[entries_len, 0, cd_bytes.len(), eocd_for_signing.len()],
+            algorithm,
+        );
         digest.try_update_section_pieces(entries_len, |push| {
             self.try_for_each_entry_section_piece(push)
         })?;
@@ -806,10 +816,24 @@ impl HapZip {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn write_entries_and_content_digest<W: Write>(
         &self,
         writer: &mut W,
         optional_block_values: &[&[u8]],
+    ) -> Result<PreparedSigningSections, SignError> {
+        self.write_entries_and_content_digest_with_algorithm(
+            writer,
+            optional_block_values,
+            crate::ContentDigestAlgorithm::Sha256,
+        )
+    }
+
+    pub(crate) fn write_entries_and_content_digest_with_algorithm<W: Write>(
+        &self,
+        writer: &mut W,
+        optional_block_values: &[&[u8]],
+        algorithm: crate::ContentDigestAlgorithm,
     ) -> Result<PreparedSigningSections, SignError> {
         let (entry_offsets, entries_len) = self.entry_offsets();
         let cd_bytes = self.build_cd(&entry_offsets);
@@ -821,12 +845,10 @@ impl HapZip {
         };
         let mut read_buffer = vec![0u8; STREAM_BUFFER_SIZE];
 
-        let mut digest = digest::HapDigestComputer::new(&[
-            entries_len,
-            0,
-            cd_bytes.len(),
-            eocd_for_signing.len(),
-        ]);
+        let mut digest = digest::HapDigestComputer::with_algorithm(
+            &[entries_len, 0, cd_bytes.len(), eocd_for_signing.len()],
+            algorithm,
+        );
         digest.try_update_section_pieces(entries_len, |push| {
             for entry in &self.entries {
                 writer.write_all(&entry.local_header_fixed)?;

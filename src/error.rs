@@ -8,9 +8,6 @@ pub enum SignError {
     #[error("signing material '{0}' must not be empty")]
     EmptyMaterial(&'static str),
 
-    #[error("input and output refer to the same path: {0}")]
-    InputOutputSame(PathBuf),
-
     // ZIP errors
     #[error("invalid ZIP file: {0}")]
     InvalidZip(&'static str),
@@ -42,6 +39,12 @@ pub enum SignError {
     #[error("signing failed: {0}")]
     SigningFailed(String),
 
+    #[error("verification failed: {0}")]
+    VerificationFailed(String),
+
+    #[error("unsupported operation: {0}")]
+    UnsupportedOperation(String),
+
     #[error("PKCS#8 key loading failed: {0}")]
     Pkcs8Error(String),
 
@@ -57,8 +60,11 @@ pub enum SignError {
     #[error("config error: {0}")]
     Config(String),
 
-    #[error("HNP code signing is not supported")]
-    UnsupportedHnpCodeSigning,
+    #[error("HNP '{0}' is not described in module.json module.hnpPackages")]
+    HnpNotDeclared(String),
+
+    #[error("invalid HNP archive '{name}': {message}")]
+    InvalidHnp { name: String, message: String },
 
     // IO errors
     #[error("IO error: {0}")]

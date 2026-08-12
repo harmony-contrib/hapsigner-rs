@@ -1,9 +1,11 @@
-//! HAP content digest: chunked SHA-256 with type-prefix byte markers.
+//! HAP content digest with type-prefix byte markers.
 //!
 //! Reference: `developtools_hapsigner` `HapUtils.java`, `SignHap.java`.
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::convert::Infallible;
+
+use crate::ContentDigestAlgorithm;
 
 /// Size of each chunk used for digest computation: 1 MiB.
 pub const CHUNK_SIZE: usize = 1_048_576;
@@ -22,21 +24,59 @@ pub const CONTENT_TYPE_BYTE: u8 = 0x5a;
 /// byte slice, so ZIP entries can be hashed without first concatenating all
 /// local headers and file data into a second full-size buffer.
 pub struct HapDigestComputer {
-    hasher: Sha256,
+    hasher: DigestState,
+    algorithm: ContentDigestAlgorithm,
+}
+
+enum DigestState {
+    Sha256(Sha256),
+    Sha384(Sha384),
+    Sha512(Sha512),
+}
+
+impl DigestState {
+    fn new(algorithm: ContentDigestAlgorithm) -> Self {
+        match algorithm {
+            ContentDigestAlgorithm::Sha256 => Self::Sha256(Sha256::new()),
+            ContentDigestAlgorithm::Sha384 => Self::Sha384(Sha384::new()),
+            ContentDigestAlgorithm::Sha512 => Self::Sha512(Sha512::new()),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Sha256(hasher) => hasher.update(bytes),
+            Self::Sha384(hasher) => hasher.update(bytes),
+            Self::Sha512(hasher) => hasher.update(bytes),
+        }
+    }
+
+    fn finalize(self) -> Vec<u8> {
+        match self {
+            Self::Sha256(hasher) => hasher.finalize().to_vec(),
+            Self::Sha384(hasher) => hasher.finalize().to_vec(),
+            Self::Sha512(hasher) => hasher.finalize().to_vec(),
+        }
+    }
 }
 
 impl HapDigestComputer {
+    #[cfg(test)]
     pub fn new(section_lengths: &[usize]) -> Self {
+        Self::with_algorithm(section_lengths, ContentDigestAlgorithm::Sha256)
+    }
+
+    pub fn with_algorithm(section_lengths: &[usize], algorithm: ContentDigestAlgorithm) -> Self {
         let total_chunks = section_lengths
             .iter()
             .map(|section_len| section_len.div_ceil(CHUNK_SIZE) as u32)
             .sum::<u32>();
 
-        let mut hasher = Sha256::new();
-        hasher.update([CONTENT_TYPE_BYTE]);
-        hasher.update(total_chunks.to_le_bytes());
+        let mut hasher = DigestState::new(algorithm);
+        hasher.update(&[CONTENT_TYPE_BYTE]);
+        hasher.update(&total_chunks.to_le_bytes());
 
-        Self { hasher }
+        Self { hasher, algorithm }
     }
 
     pub fn update_section(&mut self, section: &[u8]) {
@@ -63,6 +103,7 @@ impl HapDigestComputer {
     {
         let mut observed_len = 0usize;
         let mut pending = Vec::with_capacity(CHUNK_SIZE);
+        let algorithm = self.algorithm;
 
         {
             let hasher = &mut self.hasher;
@@ -72,7 +113,7 @@ impl HapDigestComputer {
                 while !piece.is_empty() {
                     if pending.is_empty() && piece.len() >= CHUNK_SIZE {
                         let (chunk, rest) = piece.split_at(CHUNK_SIZE);
-                        Self::update_chunk(hasher, chunk);
+                        Self::update_chunk(hasher, algorithm, chunk);
                         piece = rest;
                         continue;
                     }
@@ -83,7 +124,7 @@ impl HapDigestComputer {
                     piece = &piece[take..];
 
                     if pending.len() == CHUNK_SIZE {
-                        Self::update_chunk(hasher, &pending);
+                        Self::update_chunk(hasher, algorithm, &pending);
                         pending.clear();
                     }
                 }
@@ -92,7 +133,7 @@ impl HapDigestComputer {
             feed(&mut push)?;
 
             if !pending.is_empty() {
-                Self::update_chunk(hasher, &pending);
+                Self::update_chunk(hasher, algorithm, &pending);
             }
         }
 
@@ -103,8 +144,8 @@ impl HapDigestComputer {
         Ok(())
     }
 
-    pub fn finalize(self) -> [u8; 32] {
-        self.hasher.finalize().into()
+    pub fn finalize(self) -> Vec<u8> {
+        self.hasher.finalize()
     }
 
     /// Append a HAP optional signing block value to the top-level digest.
@@ -115,15 +156,15 @@ impl HapDigestComputer {
         self.hasher.update(value);
     }
 
-    fn update_chunk(hasher: &mut Sha256, chunk: &[u8]) {
+    fn update_chunk(hasher: &mut DigestState, algorithm: ContentDigestAlgorithm, chunk: &[u8]) {
         // Mirrors developtools_hapsigner `HapUtils.computeDigests`: hash each
         // chunk record first, then append that fixed-size chunk digest to the
         // top-level `0x5a | chunkCount | chunkDigests...` input.
-        let mut chunk_hasher = Sha256::new();
-        chunk_hasher.update([CHUNK_TYPE_BYTE]);
-        chunk_hasher.update((chunk.len() as u32).to_le_bytes());
+        let mut chunk_hasher = DigestState::new(algorithm);
+        chunk_hasher.update(&[CHUNK_TYPE_BYTE]);
+        chunk_hasher.update(&(chunk.len() as u32).to_le_bytes());
         chunk_hasher.update(chunk);
-        hasher.update(chunk_hasher.finalize());
+        hasher.update(&chunk_hasher.finalize());
     }
 }
 
@@ -144,7 +185,7 @@ pub fn compute_hap_digest(
     signing_block_bytes: &[u8],
     cd_bytes: &[u8],
     eocd_bytes: &[u8],
-) -> [u8; 32] {
+) -> Vec<u8> {
     let mut computer = HapDigestComputer::new(&[
         entries_bytes.len(),
         signing_block_bytes.len(),
@@ -193,7 +234,7 @@ mod tests {
         let mut h = Sha256::new();
         h.update([0x5a_u8]);
         h.update(0u32.to_le_bytes());
-        let expected: [u8; 32] = h.finalize().into();
+        let expected = h.finalize().to_vec();
 
         assert_eq!(
             d, expected,
@@ -227,7 +268,7 @@ mod tests {
         h.update([0x5a_u8]);
         h.update(1u32.to_le_bytes()); // total_chunks = 1
         h.update(chunk_digest);
-        let expected: [u8; 32] = h.finalize().into();
+        let expected = h.finalize().to_vec();
 
         assert_eq!(d, expected);
     }

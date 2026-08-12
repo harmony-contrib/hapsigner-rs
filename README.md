@@ -5,11 +5,13 @@
 it does not discover Hvigor projects, read `build-profile.json5`, decrypt
 DevEco secrets, or assume an SDK/install path.
 
-The signing pipeline implements HAP signing block V2/V3, CMS/PKCS#7,
-`SHA256withECDSA`, `SHA256withRSA/PSS`, ZIP alignment, page-info generation,
-and optional fs-verity code signing for ABC/native-library entries. File
-signing streams archive payloads and fs-verity inputs, then atomically persists
-the output.
+The signing pipeline implements HAP signing block V2/V3, CMS/PKCS#7, all
+official SHA-256/384/512 ECDSA and RSA-PSS algorithm names, ZIP alignment,
+page-info generation, and fs-verity code signing for ABC, native-library, HNP,
+and standalone ELF inputs. It loads both JKS and modern or legacy PKCS#12
+keystores. File signing streams archive payloads and fs-verity inputs, then
+atomically replaces the destination, including when input and output are the
+same path.
 
 ## Library
 
@@ -55,7 +57,7 @@ Library-only consumers can disable the CLI and compile the embedded development
 identity out of their artifact:
 
 ```toml
-hapsigner = { version = "0.1", default-features = false }
+hapsigner = { version = "0.2", default-features = false }
 ```
 
 `compatible_version < 8` emits the V2 signing block; version 8 or newer emits
@@ -84,13 +86,43 @@ environment so they do not appear in the process arguments:
 export HAPSIGNER_STORE_PASSWORD='store password'
 export HAPSIGNER_KEY_PASSWORD='key password'
 
-hap-sign sign-with-material entry-default-unsigned.hap \
+hap-sign sign-app entry-default-unsigned.hap \
   --keystore signing/debug.p12 \
   --profile signing/debug-profile.p7b \
   --certificate signing/debug-app-cert.pem \
   --key-alias debugKey \
   --sign-alg SHA256withECDSA
 ```
+
+`sign-app --in-form` accepts `zip`, `elf`, and `bin`; `--profile-signed 0`
+embeds raw profile JSON for ZIP/BIN input. `--proof` and `--property` load the
+official optional block bytes verbatim. The upstream tool does not generate a
+Proof-of-Rotation structure, so neither does this crate.
+
+The application and provisioning-profile verification/signing workflows are
+available as first-class commands:
+
+```bash
+hap-sign verify-app entry-default-signed.hap \
+  --out-cert-chain app-cert-chain.pem \
+  --out-profile profile.p7b
+
+hap-sign sign-profile profile.json \
+  --output profile.p7b \
+  --keystore signing/profile.jks \
+  --certificate signing/profile-cert-chain.pem \
+  --key-alias profileKey
+
+hap-sign verify-profile profile.p7b --output profile-verification.json
+```
+
+Remote signing follows the official `ISigner` boundary: library consumers
+inject an `ExternalSigner` which returns signatures, certificates, and optional
+CRLs. Official hapsigner defines no network protocol, its default
+`RemoteSigner` throws `Not implement yet`, and `remoteResign` is also
+unimplemented. The CLI therefore reports those same unsupported boundaries
+instead of inventing a transport; the library API provides the usable injected
+signer path.
 
 Inspect signing-block metadata and the embedded profile with:
 
@@ -105,14 +137,19 @@ hap-sign inspect entry-default-signed.hap
 
 ## Compatibility boundary
 
-- Supported archives are ZIP32 HAP/HSP files. ZIP64 is rejected.
+- ZIP application input uses ZIP32; ZIP64 is rejected. Standalone ELF and BIN
+  input use their official binary signing layouts.
 - Existing HAP signing blocks are replaced.
 - ELF segment discovery decodes one native library at a time; it never retains
   the complete archive, while ABC/page-info and fs-verity hashing are streamed.
-- HNP entries are rejected with `SignError::UnsupportedHnpCodeSigning` when
-  code signing is enabled; the library does not pretend to sign them.
-- HAR archives, remote signing, project configuration discovery, and DevEco
-  password-store decryption are intentionally outside this crate.
+- ELF files inside declared `module.hnpPackages` are code-signed with the
+  official `outer.hnp!/inner.so` record name and debug/private/public owner-ID
+  rules.
+- `verify-app` deliberately reports a typed unsupported result for BIN because
+  official 6.1.1.280 routes BIN verification through `VerifyElf` and rejects
+  its own `hw signed app` header.
+- HAR project orchestration, project configuration discovery, remote transport,
+  and DevEco password-store decryption are intentionally outside this crate.
 
 The observed OpenHarmony/Hvigor format contract is documented in
 [`docs/openharmony-format.md`](docs/openharmony-format.md). The project is MIT

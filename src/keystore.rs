@@ -27,6 +27,93 @@ impl Drop for SigningKey {
 }
 
 impl SigningKey {
+    pub(crate) fn normalize_certificate_chain(
+        mut certificates: Vec<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>, SignError> {
+        if certificates.is_empty() {
+            return Err(SignError::NoCertificate);
+        }
+        for certificate in &certificates {
+            Self::validate_certificate_der(certificate)?;
+        }
+        Self::sort_certificate_chain(&mut certificates)?;
+        Self::verify_certificate_chain(&certificates)?;
+        Ok(certificates)
+    }
+
+    pub(crate) fn normalize_profile_certificate_chain_at(
+        mut certificates: Vec<Vec<u8>>,
+        signing_time: SystemTime,
+    ) -> Result<Vec<Vec<u8>>, SignError> {
+        if certificates.is_empty() {
+            return Err(SignError::NoCertificate);
+        }
+        for certificate in &certificates {
+            Self::validate_certificate_der(certificate)?;
+        }
+        Self::sort_certificate_chain(&mut certificates)?;
+        Self::verify_certificate_chain_at(&certificates, signing_time, true)?;
+        Ok(certificates)
+    }
+
+    /// Load either a Java JKS (`0xFEEDFEED`) or PKCS#12 keystore using the
+    /// same format auto-detection performed by official `KeyStoreHelper`.
+    pub fn from_keystore(
+        bytes: &[u8],
+        store_password: &str,
+        key_alias: &str,
+        key_password: &str,
+    ) -> Result<Self, SignError> {
+        const JKS_MAGIC: [u8; 4] = 0xFEED_FEEDu32.to_be_bytes();
+        if bytes.starts_with(&JKS_MAGIC) {
+            Self::from_jks(bytes, store_password, key_alias, key_password)
+        } else {
+            Self::from_pkcs12(bytes, store_password, key_alias, key_password)
+        }
+    }
+
+    /// Load a legacy Java KeyStore and decrypt the selected private-key entry.
+    pub fn from_jks(
+        jks_bytes: &[u8],
+        store_password: &str,
+        key_alias: &str,
+        key_password: &str,
+    ) -> Result<Self, SignError> {
+        let mut store = jks::KeyStore::new();
+        store
+            .load(jks_bytes, store_password.as_bytes())
+            .map_err(|error| SignError::KeystoreParseError(format!("JKS parse: {error}")))?;
+        let available = store.aliases();
+        if !store.is_private_key_entry(key_alias) {
+            return Err(SignError::KeyAliasNotFound {
+                alias: key_alias.to_owned(),
+                available,
+            });
+        }
+        let entry = store
+            .get_private_key_entry(key_alias, key_password.as_bytes())
+            .map_err(|error| {
+                SignError::KeystoreParseError(format!(
+                    "JKS private key '{key_alias}' decrypt: {error}"
+                ))
+            })?;
+        if entry.private_key.is_empty() {
+            return Err(SignError::NoPrivateKey);
+        }
+        let cert_chain = entry
+            .certificate_chain
+            .into_iter()
+            .map(|certificate| certificate.content)
+            .collect::<Vec<_>>();
+        if cert_chain.is_empty() {
+            return Err(SignError::NoCertificate);
+        }
+        Ok(Self {
+            private_key_der: entry.private_key,
+            cert_chain,
+        })
+    }
+
     /// Load from a PKCS#12 (.p12 / .pfx) file.
     ///
     /// Tries the modern PBES2/AES-256-CBC path first (DevEco Studio keys),
@@ -168,17 +255,65 @@ impl SigningKey {
         if certs.len() <= 1 {
             return Ok(());
         }
-        let size = certs.len();
-        let last_subject = Self::certificate_subject_der(&certs[size - 1])?;
-        let before_last_issuer = Self::certificate_issuer_der(&certs[size - 2])?;
-        if last_subject != before_last_issuer {
-            certs.reverse();
+        let subjects = certs
+            .iter()
+            .map(|certificate| Self::certificate_subject_der(certificate))
+            .collect::<Result<Vec<_>, _>>()?;
+        let issuers = certs
+            .iter()
+            .map(|certificate| Self::certificate_issuer_der(certificate))
+            .collect::<Result<Vec<_>, _>>()?;
+        let leaf_candidates = (0..certs.len())
+            .filter(|candidate| {
+                !(0..certs.len())
+                    .any(|other| other != *candidate && issuers[other] == subjects[*candidate])
+            })
+            .collect::<Vec<_>>();
+        let [leaf] = leaf_candidates.as_slice() else {
+            return Err(SignError::DerError(
+                "certificate set does not contain one unambiguous leaf".to_owned(),
+            ));
+        };
+        let mut order = Vec::with_capacity(certs.len());
+        order.push(*leaf);
+        while order.len() < certs.len() {
+            let current = *order.last().expect("certificate order has a leaf");
+            let parent = (0..certs.len()).find(|candidate| {
+                !order.contains(candidate) && subjects[*candidate] == issuers[current]
+            });
+            let Some(parent) = parent else {
+                return Err(SignError::DerError(
+                    "certificate set is disconnected".to_owned(),
+                ));
+            };
+            order.push(parent);
+        }
+        let sorted = order
+            .into_iter()
+            .map(|index| certs[index].clone())
+            .collect::<Vec<_>>();
+        for (target, certificate) in certs.iter_mut().zip(sorted) {
+            *target = certificate;
         }
         Ok(())
     }
 
     fn verify_certificate_chain(certs: &[Vec<u8>]) -> Result<(), SignError> {
+        Self::verify_certificate_chain_at(certs, SystemTime::now(), false)
+    }
+
+    fn verify_certificate_chain_at(
+        certs: &[Vec<u8>],
+        validation_time: SystemTime,
+        validate_single: bool,
+    ) -> Result<(), SignError> {
         if certs.len() <= 1 {
+            if validate_single {
+                let certificate = certs.first().ok_or(SignError::NoCertificate)?;
+                let certificate = Certificate::from_der(certificate)
+                    .map_err(|e| SignError::DerError(format!("certificate parse: {e}")))?;
+                Self::check_certificate_validity_at(&certificate, validation_time)?;
+            }
             return Ok(());
         }
 
@@ -194,7 +329,7 @@ impl SigningKey {
             let child = &parsed[i - 1];
             let parent = &parsed[i];
             Self::verify_certificate_signature(child, parent)?;
-            Self::check_certificate_validity(child)?;
+            Self::check_certificate_validity_at(child, validation_time)?;
 
             let child_issuer = child
                 .tbs_certificate
@@ -213,23 +348,25 @@ impl SigningKey {
             }
 
             if i == parsed.len() - 1 {
-                Self::check_certificate_validity(parent)?;
+                Self::check_certificate_validity_at(parent, validation_time)?;
             }
         }
         Ok(())
     }
 
-    fn check_certificate_validity(cert: &Certificate) -> Result<(), SignError> {
-        let now = SystemTime::now();
+    fn check_certificate_validity_at(
+        cert: &Certificate,
+        validation_time: SystemTime,
+    ) -> Result<(), SignError> {
         let validity = &cert.tbs_certificate.validity;
         let not_before = validity.not_before.to_system_time();
         let not_after = validity.not_after.to_system_time();
-        if now < not_before {
+        if validation_time < not_before {
             return Err(SignError::DerError(
                 "certificate chain contains a certificate that is not yet valid".to_string(),
             ));
         }
-        if now > not_after {
+        if validation_time > not_after {
             return Err(SignError::DerError(
                 "certificate chain contains an expired certificate".to_string(),
             ));
@@ -288,21 +425,42 @@ impl SigningKey {
             .ok_or_else(|| {
                 SignError::DerError("parent EC public key has unused bits".to_string())
             })?;
-        let algorithm = match (public_key.len(), digest) {
-            (65, "SHA256") => &ring::signature::ECDSA_P256_SHA256_ASN1,
-            (65, "SHA384") => &ring::signature::ECDSA_P256_SHA384_ASN1,
-            (97, "SHA256") => &ring::signature::ECDSA_P384_SHA256_ASN1,
-            (97, "SHA384") => &ring::signature::ECDSA_P384_SHA384_ASN1,
-            (len, digest) => {
+        use sha2::Digest;
+        use signature::hazmat::PrehashVerifier;
+
+        let prehash = match digest {
+            "SHA256" => sha2::Sha256::digest(tbs_der).to_vec(),
+            "SHA384" => sha2::Sha384::digest(tbs_der).to_vec(),
+            "SHA512" => sha2::Sha512::digest(tbs_der).to_vec(),
+            digest => {
                 return Err(SignError::DerError(format!(
-                    "unsupported ECDSA certificate verification key length/digest: {len}/{digest}"
-                )));
+                    "unsupported ECDSA certificate digest: {digest}"
+                )))
             }
         };
-        let verifier = ring::signature::UnparsedPublicKey::new(algorithm, public_key);
-        verifier.verify(tbs_der, signature).map_err(|_| {
-            SignError::DerError("verify certificate chain signature failed".to_string())
-        })
+        match public_key.len() {
+            65 => {
+                let verifier = p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key)
+                    .map_err(|error| SignError::DerError(format!("parent P-256 key: {error}")))?;
+                let signature = p256::ecdsa::DerSignature::from_bytes(signature)
+                    .map_err(|error| SignError::DerError(format!("P-256 signature: {error}")))?;
+                verifier.verify_prehash(&prehash, &signature).map_err(|_| {
+                    SignError::DerError("verify certificate chain signature failed".to_string())
+                })
+            }
+            97 => {
+                let verifier = p384::ecdsa::VerifyingKey::from_sec1_bytes(public_key)
+                    .map_err(|error| SignError::DerError(format!("parent P-384 key: {error}")))?;
+                let signature = p384::ecdsa::DerSignature::from_bytes(signature)
+                    .map_err(|error| SignError::DerError(format!("P-384 signature: {error}")))?;
+                verifier.verify_prehash(&prehash, &signature).map_err(|_| {
+                    SignError::DerError("verify certificate chain signature failed".to_string())
+                })
+            }
+            len => Err(SignError::DerError(format!(
+                "unsupported ECDSA certificate verification key length: {len}"
+            ))),
+        }
     }
 
     fn verify_rsa_pkcs1_sha256_certificate_signature(
@@ -410,7 +568,6 @@ impl SigningKey {
         use pkcs12::cert_type::CertBag;
         use pkcs12::pfx::Pfx;
         use pkcs12::safe_bag::SafeContents;
-        use pkcs8::EncryptedPrivateKeyInfo;
 
         // CMS content-type OIDs (RFC 5652).
         const ID_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
@@ -472,6 +629,16 @@ impl SigningKey {
                     .map_err(|e| {
                         SignError::KeystoreParseError(format!("PBES2 params to_der: {e}"))
                     })?;
+                let algorithm_der =
+                    enc_data
+                        .enc_content_info
+                        .content_enc_alg
+                        .to_der()
+                        .map_err(|error| {
+                            SignError::KeystoreParseError(format!(
+                                "encrypted-safe algorithm encode: {error}"
+                            ))
+                        })?;
 
                 let enc_os = enc_data.enc_content_info.encrypted_content.ok_or_else(|| {
                     SignError::KeystoreParseError("missing encrypted content".into())
@@ -480,11 +647,23 @@ impl SigningKey {
                 let original_ct = enc_os.as_bytes().to_vec();
 
                 // Try store_password first; retry with key_password on failure.
-                let decrypted = Self::pbes2_decrypt(&params_der, store_password, &original_ct)
-                    .or_else(|_| Self::pbes2_decrypt(&params_der, key_password, &original_ct))
-                    .map_err(|e| {
-                        SignError::KeystoreParseError(format!("PBES2 decrypt (safe): {e}"))
-                    })?;
+                let decrypted = Self::decrypt_pkcs12_encryption(
+                    &algorithm_der,
+                    &params_der,
+                    store_password,
+                    &original_ct,
+                )
+                .or_else(|_| {
+                    Self::decrypt_pkcs12_encryption(
+                        &algorithm_der,
+                        &params_der,
+                        key_password,
+                        &original_ct,
+                    )
+                })
+                .map_err(|e| {
+                    SignError::KeystoreParseError(format!("encrypted-safe decrypt: {e}"))
+                })?;
 
                 safe_contents_bytes = decrypted;
             } else {
@@ -500,21 +679,8 @@ impl SigningKey {
                 match bag.bag_id {
                     pkcs12::PKCS_12_PKCS8_KEY_BAG_OID => {
                         // ShroudedKeyBag → [0] EXPLICIT EncryptedPrivateKeyInfo
-                        let cs: ContextSpecific<EncryptedPrivateKeyInfo<'_>> =
-                            ContextSpecific::from_der(&bag.bag_value).map_err(|e| {
-                                SignError::KeystoreParseError(format!(
-                                    "shrouded key bag parse: {e}"
-                                ))
-                            })?;
-                        let mut ct = cs.value.encrypted_data.to_vec();
-                        let pt = cs
-                            .value
-                            .encryption_algorithm
-                            .decrypt_in_place(key_password, &mut ct)
-                            .map_err(|e| {
-                                SignError::KeystoreParseError(format!("key decrypt: {e}"))
-                            })?;
-                        private_keys.push((Self::modern_friendly_name(&bag)?, pt.to_vec()));
+                        let key = Self::decrypt_shrouded_key(&bag.bag_value, key_password)?;
+                        private_keys.push((Self::modern_friendly_name(&bag)?, key));
                     }
                     pkcs12::PKCS_12_KEY_BAG_OID => {
                         // Plain (unencrypted) PKCS#8 KeyBag
@@ -572,6 +738,65 @@ impl SigningKey {
             .decrypt_in_place(password, &mut ct)
             .map_err(|e| format!("decrypt_in_place: {e}"))?;
         Ok(pt.to_vec())
+    }
+
+    fn decrypt_pkcs12_encryption(
+        algorithm_der: &[u8],
+        params_der: &[u8],
+        password: &str,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if let Ok(plaintext) = Self::pbes2_decrypt(params_der, password, ciphertext) {
+            return Ok(plaintext);
+        }
+        let algorithm = yasna::parse_der(algorithm_der, p12::AlgorithmIdentifier::parse)
+            .map_err(|error| format!("legacy PBE algorithm parse: {error:?}"))?;
+        let mut bmp_password = Vec::with_capacity(password.len() * 2 + 2);
+        for codepoint in password.encode_utf16() {
+            bmp_password.extend_from_slice(&codepoint.to_be_bytes());
+        }
+        bmp_password.extend_from_slice(&[0, 0]);
+        algorithm
+            .decrypt_pbe(ciphertext, &bmp_password)
+            .ok_or_else(|| "legacy PKCS#12 PBE decrypt failed".to_owned())
+    }
+
+    fn decrypt_shrouded_key(bag_value: &[u8], key_password: &str) -> Result<Vec<u8>, SignError> {
+        use der::asn1::AnyRef;
+        use der::Decode;
+        use pkcs8::EncryptedPrivateKeyInfo;
+
+        let wrapper = AnyRef::from_der(bag_value).map_err(|error| {
+            SignError::KeystoreParseError(format!("shrouded key wrapper: {error}"))
+        })?;
+        let encrypted_private_key = wrapper.value();
+
+        if let Ok(encrypted) = EncryptedPrivateKeyInfo::from_der(encrypted_private_key) {
+            let mut ciphertext = encrypted.encrypted_data.to_vec();
+            if let Ok(private_key) = encrypted
+                .encryption_algorithm
+                .decrypt_in_place(key_password, &mut ciphertext)
+            {
+                return Ok(private_key.to_vec());
+            }
+        }
+
+        let encrypted =
+            yasna::parse_der(encrypted_private_key, p12::EncryptedPrivateKeyInfo::parse).map_err(
+                |error| {
+                    SignError::KeystoreParseError(format!("legacy shrouded key parse: {error:?}"))
+                },
+            )?;
+        let mut password = Vec::with_capacity(key_password.len() * 2 + 2);
+        for codepoint in key_password.encode_utf16() {
+            password.extend_from_slice(&codepoint.to_be_bytes());
+        }
+        password.extend_from_slice(&[0, 0]);
+        encrypted.decrypt(&password).ok_or_else(|| {
+            SignError::KeystoreParseError(
+                "shrouded key decryption failed for PBES2 and PKCS#12 PBE".to_owned(),
+            )
+        })
     }
 
     // -----------------------------------------------------------------------

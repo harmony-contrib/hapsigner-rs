@@ -1,7 +1,8 @@
 use crate::profile_content::ProfileContent;
-use crate::{pkcs7, signing_block, zip::HapZip, SignError, SigningKey};
-use rayon::prelude::*;
+use crate::remote::SigningIdentity;
+use crate::{pkcs7, signing_block, zip::HapZip, SignError, SigningBlockInfo};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 const PAGE_SIZE: usize = 4096;
 const DIGEST_SIZE: usize = 32;
@@ -33,21 +34,92 @@ const EXTENSION_MERKLE_TREE_INLINED: u32 = 0x1;
 const EXTENSION_MERKLE_TREE_SIZE: u32 = 80;
 
 pub(crate) struct CodeSignPropertyBuilder<'a> {
-    signing_key: &'a SigningKey,
+    signing_identity: &'a SigningIdentity,
     alg_id: u32,
     profile: ProfileContent,
 }
 
-impl<'a> CodeSignPropertyBuilder<'a> {
+pub(crate) struct ElfCodeSignBuilder<'a> {
+    signing_identity: &'a SigningIdentity,
+    alg_id: u32,
+    profile: Option<ProfileContent>,
+}
+
+impl<'a> ElfCodeSignBuilder<'a> {
     pub(crate) fn new(
-        signing_key: &'a SigningKey,
+        signing_identity: &'a SigningIdentity,
         alg_id: u32,
         profile_bytes: &[u8],
+        profile_signed: bool,
     ) -> Result<Self, SignError> {
         Ok(Self {
-            signing_key,
+            signing_identity,
             alg_id,
-            profile: ProfileContent::from_signed_profile(profile_bytes)?,
+            profile: if profile_bytes.is_empty() {
+                None
+            } else {
+                Some(ProfileContent::from_profile(profile_bytes, profile_signed)?)
+            },
+        })
+    }
+
+    pub(crate) fn build(&self, data: &[u8], code_sign_offset: usize) -> Result<Vec<u8>, SignError> {
+        const INLINE_MERKLE_TREE_TYPE: u32 = 2;
+        const FS_VERITY_DESCRIPTOR_TYPE: u32 = 1;
+
+        let padding = (PAGE_SIZE - (code_sign_offset + 8) % PAGE_SIZE) % PAGE_SIZE;
+        let tree_offset = code_sign_offset
+            .checked_add(8 + padding)
+            .ok_or_else(|| SignError::SigningFailed("ELF tree offset overflow".to_owned()))?;
+        let fsverity = FsVerityGenerator::generate(data, tree_offset as u64)?;
+        let signed_data_builder =
+            pkcs7::CodeSignSignedDataBuilder::from_identity(self.signing_identity, self.alg_id)?;
+        let owner_id = self
+            .profile
+            .as_ref()
+            .map(ProfileContent::owner_id)
+            .transpose()?
+            .unwrap_or_else(|| Some("DEBUG_LIB_ID".to_owned()));
+        let signature = signed_data_builder.build(&fsverity.digest, owner_id.as_deref(), None)?;
+        let descriptor = FsVerityDescriptor {
+            file_size: data.len() as u64,
+            root_hash: fsverity.root_hash,
+            flags: FS_VERITY_DESCRIPTOR_FLAG_STORE_MERKLE_TREE_OFFSET,
+            merkle_tree_offset: tree_offset as u64,
+        }
+        .to_bytes(signature.len())?;
+
+        let tree_length = padding
+            .checked_add(fsverity.tree.len())
+            .ok_or_else(|| SignError::SigningFailed("ELF tree length overflow".to_owned()))?;
+        let descriptor_length = descriptor
+            .len()
+            .checked_add(signature.len())
+            .ok_or_else(|| SignError::SigningFailed("ELF descriptor length overflow".to_owned()))?;
+        let mut output = Vec::with_capacity(16 + tree_length + descriptor_length);
+        output.extend_from_slice(&INLINE_MERKLE_TREE_TYPE.to_le_bytes());
+        output.extend_from_slice(&(tree_length as u32).to_le_bytes());
+        output.resize(output.len() + padding, 0);
+        output.extend_from_slice(&fsverity.tree);
+        output.extend_from_slice(&FS_VERITY_DESCRIPTOR_TYPE.to_le_bytes());
+        output.extend_from_slice(&(descriptor_length as u32).to_le_bytes());
+        output.extend_from_slice(&descriptor);
+        output.extend_from_slice(&signature);
+        Ok(output)
+    }
+}
+
+impl<'a> CodeSignPropertyBuilder<'a> {
+    pub(crate) fn new(
+        signing_identity: &'a SigningIdentity,
+        alg_id: u32,
+        profile_bytes: &[u8],
+        profile_signed: bool,
+    ) -> Result<Self, SignError> {
+        Ok(Self {
+            signing_identity,
+            alg_id,
+            profile: ProfileContent::from_profile(profile_bytes, profile_signed)?,
         })
     }
 
@@ -57,12 +129,14 @@ impl<'a> CodeSignPropertyBuilder<'a> {
         code_sign_offset: usize,
     ) -> Result<Vec<u8>, SignError> {
         let owner_id = self.profile.owner_id()?;
+        let public_hnp_owner_id = self.profile.public_hnp_owner_id()?;
         let plugin_id = self.plugin_id_if_needed(hap_zip)?;
         let code_sign_block = CodeSignBlockBuilder::new(
             hap_zip,
-            self.signing_key,
+            self.signing_identity,
             self.alg_id,
             owner_id,
+            public_hnp_owner_id,
             plugin_id,
             code_sign_offset,
         )
@@ -98,9 +172,10 @@ impl<'a> CodeSignPropertyBuilder<'a> {
 
 struct CodeSignBlockBuilder<'a> {
     hap_zip: &'a HapZip,
-    signing_key: &'a SigningKey,
+    signing_identity: &'a SigningIdentity,
     alg_id: u32,
     owner_id: Option<String>,
+    public_hnp_owner_id: &'static str,
     plugin_id: Option<String>,
     code_sign_offset: usize,
 }
@@ -108,29 +183,27 @@ struct CodeSignBlockBuilder<'a> {
 impl<'a> CodeSignBlockBuilder<'a> {
     fn new(
         hap_zip: &'a HapZip,
-        signing_key: &'a SigningKey,
+        signing_identity: &'a SigningIdentity,
         alg_id: u32,
         owner_id: Option<String>,
+        public_hnp_owner_id: &'static str,
         plugin_id: Option<String>,
         code_sign_offset: usize,
     ) -> Self {
         Self {
             hap_zip,
-            signing_key,
+            signing_identity,
             alg_id,
             owner_id,
+            public_hnp_owner_id,
             plugin_id,
             code_sign_offset,
         }
     }
 
     fn build(&self) -> Result<Vec<u8>, SignError> {
-        self.reject_hnp_entries()?;
-        let signed_data_builder = pkcs7::CodeSignSignedDataBuilder::new(
-            &self.signing_key.private_key_der,
-            &self.signing_key.cert_chain,
-            self.alg_id,
-        )?;
+        let signed_data_builder =
+            pkcs7::CodeSignSignedDataBuilder::from_identity(self.signing_identity, self.alg_id)?;
 
         let zero_padding_len = self.merkle_tree_padding_len();
         let fsv_tree_offset = self.code_sign_offset
@@ -144,8 +217,11 @@ impl<'a> CodeSignBlockBuilder<'a> {
                 self.hap_zip
                     .try_for_each_entry_section_prefix_piece(data_size, push)
             })?;
-        let hap_signature =
-            self.sign_fsverity_digest(&signed_data_builder, &hap_fsverity.digest)?;
+        let hap_signature = self.sign_fsverity_digest(
+            &signed_data_builder,
+            &hap_fsverity.digest,
+            self.owner_id.as_deref(),
+        )?;
         let mut hap_sign_info = SignInfo::new(
             SIGN_INFO_FLAG_MERKLE_TREE_INCLUDED,
             data_size as u64,
@@ -212,18 +288,6 @@ impl<'a> CodeSignBlockBuilder<'a> {
         Ok(output)
     }
 
-    fn reject_hnp_entries(&self) -> Result<(), SignError> {
-        if self
-            .hap_zip
-            .entries
-            .iter()
-            .any(|entry| entry.name.starts_with("hnp/") && entry.name.ends_with(".hnp"))
-        {
-            return Err(SignError::UnsupportedHnpCodeSigning);
-        }
-        Ok(())
-    }
-
     fn merkle_tree_padding_len(&self) -> usize {
         let size_without_merkle =
             CODE_SIGN_BLOCK_HEADER_SIZE + CODE_SIGN_SEGMENT_COUNT * CODE_SIGN_SEGMENT_HEADER_SIZE;
@@ -239,31 +303,113 @@ impl<'a> CodeSignBlockBuilder<'a> {
         &self,
         signed_data_builder: &pkcs7::CodeSignSignedDataBuilder,
     ) -> Result<Vec<(String, SignInfo)>, SignError> {
-        let mut entries = self
+        let entries = self
             .hap_zip
             .native_entry_names()
-            .into_par_iter()
-            .enumerate()
-            .map(|(index, name)| {
+            .into_iter()
+            .map(|name| {
                 let data_size = self.hap_zip.uncompressed_entry_size(&name)?;
                 let fsverity = FsVerityGenerator::generate_pieces(data_size, 0, |push| {
                     self.hap_zip
                         .try_for_each_uncompressed_entry_piece(&name, push)
                 })?;
-                let signature = self.sign_fsverity_digest(signed_data_builder, &fsverity.digest)?;
-                Ok::<_, SignError>((index, (name, SignInfo::new(0, data_size as u64, signature))))
+                let signature = self.sign_fsverity_digest(
+                    signed_data_builder,
+                    &fsverity.digest,
+                    self.owner_id.as_deref(),
+                )?;
+                Ok::<_, SignError>((name, SignInfo::new(0, data_size as u64, signature)))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|(index, _)| *index);
-        Ok(entries.into_iter().map(|(_, entry)| entry).collect())
+        let mut signed = entries;
+        signed.extend(self.hnp_sign_infos(signed_data_builder)?);
+        Ok(signed)
+    }
+
+    fn hnp_sign_infos(
+        &self,
+        signed_data_builder: &pkcs7::CodeSignSignedDataBuilder,
+    ) -> Result<Vec<(String, SignInfo)>, SignError> {
+        let packages = self.hnp_packages()?;
+        let mut result = Vec::new();
+        for entry in self.hap_zip.entries.iter().filter(|entry| {
+            entry.name.starts_with("hnp/") && entry.name.to_ascii_lowercase().ends_with(".hnp")
+        }) {
+            let package_name = entry.name.split('/').skip(2).collect::<Vec<_>>().join("/");
+            let package_type = packages
+                .get(&package_name)
+                .ok_or_else(|| SignError::HnpNotDeclared(entry.name.clone()))?;
+            let owner_id = if package_type == "public" {
+                Some(self.public_hnp_owner_id)
+            } else {
+                self.owner_id.as_deref()
+            };
+            let bytes = self.hap_zip.read_uncompressed_entry(&entry.name)?;
+            let hnp = HapZip::parse_owned(bytes).map_err(|error| SignError::InvalidHnp {
+                name: entry.name.clone(),
+                message: error.to_string(),
+            })?;
+            let signed_entries = hnp
+                .entries
+                .iter()
+                .map(|inner_entry| {
+                    let data = hnp.read_uncompressed_entry(&inner_entry.name)?;
+                    if !data.starts_with(b"\x7fELF") {
+                        return Ok(None);
+                    }
+                    let fsverity = FsVerityGenerator::generate(&data, 0)?;
+                    let signature =
+                        self.sign_fsverity_digest(signed_data_builder, &fsverity.digest, owner_id)?;
+                    Ok::<_, SignError>(Some((
+                        format!("{}!/{}", entry.name, inner_entry.name),
+                        SignInfo::new(0, data.len() as u64, signature),
+                    )))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            result.extend(signed_entries);
+        }
+        Ok(result)
+    }
+
+    fn hnp_packages(&self) -> Result<BTreeMap<String, String>, SignError> {
+        let Ok(module_json) = self.hap_zip.read_uncompressed_entry("module.json") else {
+            return Ok(BTreeMap::new());
+        };
+        let value: serde_json::Value = serde_json::from_slice(&module_json).map_err(|error| {
+            SignError::Config(format!("module.json is not valid JSON: {error}"))
+        })?;
+        let packages = value
+            .get("module")
+            .and_then(|module| module.get("hnpPackages"))
+            .and_then(serde_json::Value::as_array);
+        let mut inventory = BTreeMap::new();
+        for package in packages.into_iter().flatten() {
+            let Some(name) = package.get("package").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let package_type = package
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("private");
+            inventory.insert(name.to_owned(), package_type.to_owned());
+        }
+        Ok(inventory)
     }
 
     fn sign_fsverity_digest(
         &self,
         signed_data_builder: &pkcs7::CodeSignSignedDataBuilder,
         digest: &[u8],
+        owner_id: Option<&str>,
     ) -> Result<Vec<u8>, SignError> {
-        signed_data_builder.build(digest, self.owner_id.as_deref(), self.plugin_id.as_deref())
+        signed_data_builder.build(digest, owner_id, self.plugin_id.as_deref())
     }
 }
 
@@ -275,8 +421,456 @@ struct FsVerityOutput {
     root_hash: [u8; DIGEST_SIZE],
 }
 
+pub(crate) struct CodeSignVerifier<'a> {
+    input: &'a [u8],
+    profile: Option<&'a ProfileContent>,
+}
+
+struct ParsedSignInfo<'a> {
+    data_size: usize,
+    signature: &'a [u8],
+    merkle_tree: Option<ParsedMerkleTree>,
+}
+
+struct ParsedMerkleTree {
+    size: usize,
+    offset: usize,
+    root_hash: [u8; DIGEST_SIZE],
+}
+
+impl<'a> CodeSignVerifier<'a> {
+    pub(crate) fn new(input: &'a [u8], profile: Option<&'a ProfileContent>) -> Self {
+        Self { input, profile }
+    }
+
+    pub(crate) fn verify_hap_properties(
+        &self,
+        signing_block: &SigningBlockInfo,
+    ) -> Result<(), SignError> {
+        for entry in signing_block
+            .blocks
+            .iter()
+            .filter(|entry| entry.block_type == signing_block::BLOCK_ID_PROPERTY)
+        {
+            let property = self.slice(entry.offset, entry.length, "HAP property block")?;
+            if property.len() < 12
+                || Self::read_u32(property, 0)? != signing_block::BLOCK_ID_CODE_SIGN
+            {
+                continue;
+            }
+            let length = Self::read_u32(property, 4)? as usize;
+            let offset = Self::read_u32(property, 8)? as usize;
+            if offset != entry.offset + 12 || length.checked_add(12) != Some(property.len()) {
+                return Err(SignError::VerificationFailed(
+                    "HAP code-sign property offset or length is invalid".to_owned(),
+                ));
+            }
+            self.verify_hap_block(&property[12..], offset)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_elf_block(
+        &self,
+        signed_data: &[u8],
+        block: &[u8],
+        block_offset: usize,
+    ) -> Result<(), SignError> {
+        let tree_type = Self::read_u32(block, 0)?;
+        let tree_length = Self::read_u32(block, 4)? as usize;
+        if tree_type != 2 {
+            return Err(SignError::VerificationFailed(
+                "ELF code-sign block has no inline Merkle tree".to_owned(),
+            ));
+        }
+        let descriptor_head = 8usize.checked_add(tree_length).ok_or_else(|| {
+            SignError::VerificationFailed("ELF code-sign tree length overflow".to_owned())
+        })?;
+        if Self::read_u32(block, descriptor_head)? != 1 {
+            return Err(SignError::VerificationFailed(
+                "ELF code-sign block has no fs-verity descriptor".to_owned(),
+            ));
+        }
+        let descriptor_length = Self::read_u32(block, descriptor_head + 4)? as usize;
+        let descriptor_start = descriptor_head + 8;
+        let descriptor_end = descriptor_start
+            .checked_add(descriptor_length)
+            .ok_or_else(|| {
+                SignError::VerificationFailed("ELF descriptor length overflow".to_owned())
+            })?;
+        if descriptor_end != block.len() || descriptor_length < FS_VERITY_DESCRIPTOR_SIZE {
+            return Err(SignError::VerificationFailed(
+                "ELF fs-verity descriptor range is invalid".to_owned(),
+            ));
+        }
+        let descriptor = &block[descriptor_start..descriptor_start + FS_VERITY_DESCRIPTOR_SIZE];
+        let signature_length = Self::read_u32(descriptor, 4)? as usize;
+        if FS_VERITY_DESCRIPTOR_SIZE.checked_add(signature_length) != Some(descriptor_length) {
+            return Err(SignError::VerificationFailed(
+                "ELF code-sign signature length is invalid".to_owned(),
+            ));
+        }
+        let file_size = Self::read_u64(descriptor, 8)? as usize;
+        if file_size != signed_data.len() {
+            return Err(SignError::VerificationFailed(
+                "ELF fs-verity file size does not match signed data".to_owned(),
+            ));
+        }
+        let tree_offset = Self::read_u64(descriptor, 120)? as usize;
+        let expected_tree_start = block_offset
+            .checked_add(8)
+            .ok_or_else(|| SignError::VerificationFailed("ELF tree offset overflow".to_owned()))?;
+        if tree_offset < expected_tree_start || tree_offset > block_offset + descriptor_head {
+            return Err(SignError::VerificationFailed(
+                "ELF fs-verity tree offset is outside the tree block".to_owned(),
+            ));
+        }
+        let padding = tree_offset - expected_tree_start;
+        let fsverity = FsVerityGenerator::generate(signed_data, tree_offset as u64)?;
+        if tree_length != padding + fsverity.tree.len()
+            || block[8..8 + padding].iter().any(|byte| *byte != 0)
+            || block[8 + padding..descriptor_head] != fsverity.tree
+            || descriptor[16..48] != fsverity.root_hash
+        {
+            return Err(SignError::VerificationFailed(
+                "ELF fs-verity Merkle tree or root hash is invalid".to_owned(),
+            ));
+        }
+        let signature = &block[descriptor_start + FS_VERITY_DESCRIPTOR_SIZE..descriptor_end];
+        let verified = pkcs7::verify_detached_cms_signed_data(signature, &fsverity.digest)?;
+        self.verify_owner_id(&verified, false)?;
+        Ok(())
+    }
+
+    fn verify_hap_block(&self, block: &[u8], block_offset: usize) -> Result<(), SignError> {
+        if block.len() < CODE_SIGN_BLOCK_HEADER_SIZE
+            || Self::read_u64(block, 0)? != CODE_SIGN_BLOCK_MAGIC
+            || Self::read_u32(block, 8)? != CODE_SIGN_BLOCK_VERSION
+            || Self::read_u32(block, 12)? as usize != block.len()
+        {
+            return Err(SignError::VerificationFailed(
+                "HAP code-sign header is invalid".to_owned(),
+            ));
+        }
+        let segment_count = Self::read_u32(block, 16)? as usize;
+        let headers_end = CODE_SIGN_BLOCK_HEADER_SIZE
+            .checked_add(
+                segment_count
+                    .checked_mul(CODE_SIGN_SEGMENT_HEADER_SIZE)
+                    .ok_or_else(|| {
+                        SignError::VerificationFailed("code-sign segment count overflow".to_owned())
+                    })?,
+            )
+            .ok_or_else(|| {
+                SignError::VerificationFailed("code-sign segment headers overflow".to_owned())
+            })?;
+        if headers_end > block.len() {
+            return Err(SignError::VerificationFailed(
+                "HAP code-sign segment headers are truncated".to_owned(),
+            ));
+        }
+        let mut hap_segment = None;
+        let mut native_segment = None;
+        for index in 0..segment_count {
+            let header = CODE_SIGN_BLOCK_HEADER_SIZE + index * CODE_SIGN_SEGMENT_HEADER_SIZE;
+            let segment_type = Self::read_u32(block, header)?;
+            let offset = Self::read_u32(block, header + 4)? as usize;
+            let size = Self::read_u32(block, header + 8)? as usize;
+            let segment = block
+                .get(
+                    offset..offset.checked_add(size).ok_or_else(|| {
+                        SignError::VerificationFailed("code-sign segment range overflow".to_owned())
+                    })?,
+                )
+                .ok_or_else(|| {
+                    SignError::VerificationFailed("code-sign segment exceeds block".to_owned())
+                })?;
+            match segment_type {
+                SEGMENT_HAP_INFO => hap_segment = Some(segment),
+                SEGMENT_NATIVE_LIB_INFO => native_segment = Some(segment),
+                _ => {}
+            }
+        }
+        let hap_segment = hap_segment.ok_or_else(|| {
+            SignError::VerificationFailed("HAP code-sign block has no HAP info segment".to_owned())
+        })?;
+        if Self::read_u32(hap_segment, 0)? != HAP_INFO_MAGIC {
+            return Err(SignError::VerificationFailed(
+                "HAP info segment magic is invalid".to_owned(),
+            ));
+        }
+        let hap_sign_info = self.parse_sign_info(hap_segment, 4)?;
+        let merkle_tree = hap_sign_info.merkle_tree.as_ref().ok_or_else(|| {
+            SignError::VerificationFailed("HAP sign info has no Merkle-tree extension".to_owned())
+        })?;
+        let data = self.input.get(..hap_sign_info.data_size).ok_or_else(|| {
+            SignError::VerificationFailed("HAP code-sign data size exceeds input".to_owned())
+        })?;
+        let fsverity = FsVerityGenerator::generate(data, merkle_tree.offset as u64)?;
+        let relative_tree_offset =
+            merkle_tree
+                .offset
+                .checked_sub(block_offset)
+                .ok_or_else(|| {
+                    SignError::VerificationFailed(
+                        "HAP Merkle-tree offset precedes code-sign block".to_owned(),
+                    )
+                })?;
+        let embedded_tree = block
+            .get(
+                relative_tree_offset
+                    ..relative_tree_offset
+                        .checked_add(merkle_tree.size)
+                        .ok_or_else(|| {
+                            SignError::VerificationFailed(
+                                "HAP Merkle-tree range overflow".to_owned(),
+                            )
+                        })?,
+            )
+            .ok_or_else(|| {
+                SignError::VerificationFailed("HAP Merkle tree exceeds code-sign block".to_owned())
+            })?;
+        if embedded_tree != fsverity.tree || merkle_tree.root_hash != fsverity.root_hash {
+            return Err(SignError::VerificationFailed(
+                "HAP fs-verity Merkle tree or root hash is invalid".to_owned(),
+            ));
+        }
+        let verified =
+            pkcs7::verify_detached_cms_signed_data(hap_sign_info.signature, &fsverity.digest)?;
+        self.verify_owner_id(&verified, false)?;
+        if let Some(native_segment) = native_segment {
+            self.verify_native_segment(native_segment)?;
+        }
+        Ok(())
+    }
+
+    fn verify_native_segment(&self, segment: &[u8]) -> Result<(), SignError> {
+        if Self::read_u32(segment, 0)? != NATIVE_LIB_INFO_MAGIC
+            || Self::read_u32(segment, 4)? as usize != segment.len()
+        {
+            return Err(SignError::VerificationFailed(
+                "native-library code-sign segment is invalid".to_owned(),
+            ));
+        }
+        let count = Self::read_u32(segment, 8)? as usize;
+        let records_end = 12usize
+            .checked_add(count.checked_mul(16).ok_or_else(|| {
+                SignError::VerificationFailed("native sign-info count overflow".to_owned())
+            })?)
+            .ok_or_else(|| {
+                SignError::VerificationFailed("native sign-info table overflow".to_owned())
+            })?;
+        if records_end > segment.len() {
+            return Err(SignError::VerificationFailed(
+                "native sign-info table is truncated".to_owned(),
+            ));
+        }
+        let hap = HapZip::parse(self.input)?;
+        for index in 0..count {
+            let record = 12 + index * 16;
+            let name_offset = Self::read_u32(segment, record)? as usize;
+            let name_length = Self::read_u32(segment, record + 4)? as usize;
+            let sign_info_offset = Self::read_u32(segment, record + 8)? as usize;
+            let sign_info_length = Self::read_u32(segment, record + 12)? as usize;
+            let name = std::str::from_utf8(self.segment_slice(
+                segment,
+                name_offset,
+                name_length,
+                "native sign-info name",
+            )?)
+            .map_err(|error| {
+                SignError::VerificationFailed(format!(
+                    "native sign-info name is not UTF-8: {error}"
+                ))
+            })?;
+            let sign_info_bytes = self.segment_slice(
+                segment,
+                sign_info_offset,
+                sign_info_length,
+                "native sign-info",
+            )?;
+            let sign_info = self.parse_sign_info(sign_info_bytes, 0)?;
+            let data = self.native_entry_data(&hap, name)?;
+            if data.len() != sign_info.data_size {
+                return Err(SignError::VerificationFailed(format!(
+                    "native code-sign data size differs for '{name}'"
+                )));
+            }
+            let fsverity = FsVerityGenerator::generate(&data, 0)?;
+            let verified =
+                pkcs7::verify_detached_cms_signed_data(sign_info.signature, &fsverity.digest)?;
+            self.verify_owner_id(&verified, self.is_public_hnp(&hap, name)?)?;
+        }
+        Ok(())
+    }
+
+    fn native_entry_data(&self, hap: &HapZip, name: &str) -> Result<Vec<u8>, SignError> {
+        let Some((outer, inner)) = name.split_once("!/") else {
+            return hap.read_uncompressed_entry(name);
+        };
+        let hnp_bytes = hap.read_uncompressed_entry(outer)?;
+        let hnp = HapZip::parse_owned(hnp_bytes).map_err(|error| SignError::InvalidHnp {
+            name: outer.to_owned(),
+            message: error.to_string(),
+        })?;
+        hnp.read_uncompressed_entry(inner)
+    }
+
+    fn is_public_hnp(&self, hap: &HapZip, name: &str) -> Result<bool, SignError> {
+        let Some((outer, _)) = name.split_once("!/") else {
+            return Ok(false);
+        };
+        let package_name = outer.split('/').skip(2).collect::<Vec<_>>().join("/");
+        let module_json = hap.read_uncompressed_entry("module.json")?;
+        let value: serde_json::Value = serde_json::from_slice(&module_json).map_err(|error| {
+            SignError::VerificationFailed(format!("module.json is not valid JSON: {error}"))
+        })?;
+        let packages = value
+            .get("module")
+            .and_then(|module| module.get("hnpPackages"))
+            .and_then(serde_json::Value::as_array);
+        let package_type = packages
+            .into_iter()
+            .flatten()
+            .find(|package| {
+                package.get("package").and_then(serde_json::Value::as_str)
+                    == Some(package_name.as_str())
+            })
+            .ok_or_else(|| SignError::HnpNotDeclared(outer.to_owned()))?
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("private");
+        Ok(package_type == "public")
+    }
+
+    fn verify_owner_id(
+        &self,
+        verified: &pkcs7::VerifiedCms,
+        public_hnp: bool,
+    ) -> Result<(), SignError> {
+        let Some(profile) = self.profile else {
+            return Ok(());
+        };
+        let debug = profile.profile_type()?.eq_ignore_ascii_case("debug");
+        let expected = if public_hnp {
+            Some(profile.public_hnp_owner_id()?.to_owned())
+        } else {
+            profile.owner_id()?
+        };
+        match (&verified.owner_id, expected.as_deref()) {
+            (None, _) if debug => Ok(()),
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(SignError::VerificationFailed(
+                "app-identifier is not in the code signature".to_owned(),
+            )),
+            (Some(_), None) => Err(SignError::VerificationFailed(
+                "app-identifier is present in the code signature but absent from the profile"
+                    .to_owned(),
+            )),
+            (Some(actual), Some(expected)) if actual == expected => Ok(()),
+            (Some(_), Some(_)) => Err(SignError::VerificationFailed(
+                "app-identifier in the code signature does not match the profile".to_owned(),
+            )),
+        }
+    }
+
+    fn parse_sign_info<'b>(
+        &self,
+        bytes: &'b [u8],
+        start: usize,
+    ) -> Result<ParsedSignInfo<'b>, SignError> {
+        let fixed = self.segment_slice(bytes, start, SIGN_INFO_FIXED_SIZE, "sign info")?;
+        let signature_length = Self::read_u32(fixed, 4)? as usize;
+        let data_size = usize::try_from(Self::read_u64(fixed, 12)?).map_err(|_| {
+            SignError::VerificationFailed("code-sign data size exceeds usize".to_owned())
+        })?;
+        let extension_count = Self::read_u32(fixed, 52)? as usize;
+        let extension_offset = Self::read_u32(fixed, 56)? as usize;
+        let signature = self.segment_slice(
+            bytes,
+            start + SIGN_INFO_FIXED_SIZE,
+            signature_length,
+            "code-sign CMS signature",
+        )?;
+        let mut merkle_tree = None;
+        let mut extension = start.checked_add(extension_offset).ok_or_else(|| {
+            SignError::VerificationFailed("code-sign extension offset overflow".to_owned())
+        })?;
+        for _ in 0..extension_count {
+            let extension_type = Self::read_u32(bytes, extension)?;
+            let extension_size = Self::read_u32(bytes, extension + 4)? as usize;
+            let extension_data =
+                self.segment_slice(bytes, extension + 8, extension_size, "code-sign extension")?;
+            if extension_type == EXTENSION_MERKLE_TREE_INLINED {
+                if extension_size != EXTENSION_MERKLE_TREE_SIZE as usize {
+                    return Err(SignError::VerificationFailed(
+                        "Merkle-tree extension size is invalid".to_owned(),
+                    ));
+                }
+                let mut root_hash = [0u8; DIGEST_SIZE];
+                root_hash.copy_from_slice(&extension_data[16..16 + DIGEST_SIZE]);
+                merkle_tree = Some(ParsedMerkleTree {
+                    size: usize::try_from(Self::read_u64(extension_data, 0)?).map_err(|_| {
+                        SignError::VerificationFailed("Merkle-tree size exceeds usize".to_owned())
+                    })?,
+                    offset: usize::try_from(Self::read_u64(extension_data, 8)?).map_err(|_| {
+                        SignError::VerificationFailed("Merkle-tree offset exceeds usize".to_owned())
+                    })?,
+                    root_hash,
+                });
+            }
+            extension = extension.checked_add(8 + extension_size).ok_or_else(|| {
+                SignError::VerificationFailed("code-sign extension range overflow".to_owned())
+            })?;
+        }
+        Ok(ParsedSignInfo {
+            data_size,
+            signature,
+            merkle_tree,
+        })
+    }
+
+    fn segment_slice<'b>(
+        &self,
+        bytes: &'b [u8],
+        offset: usize,
+        length: usize,
+        label: &str,
+    ) -> Result<&'b [u8], SignError> {
+        bytes
+            .get(
+                offset..offset.checked_add(length).ok_or_else(|| {
+                    SignError::VerificationFailed(format!("{label} range overflow"))
+                })?,
+            )
+            .ok_or_else(|| SignError::VerificationFailed(format!("{label} is truncated")))
+    }
+
+    fn slice(&self, offset: usize, length: usize, label: &str) -> Result<&'a [u8], SignError> {
+        self.segment_slice(self.input, offset, length, label)
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, SignError> {
+        bytes
+            .get(offset..offset + 4)
+            .map(|value| u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+            .ok_or_else(|| SignError::VerificationFailed("truncated code-sign u32".to_owned()))
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, SignError> {
+        bytes
+            .get(offset..offset + 8)
+            .map(|value| {
+                u64::from_le_bytes([
+                    value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+                ])
+            })
+            .ok_or_else(|| SignError::VerificationFailed("truncated code-sign u64".to_owned()))
+    }
+}
+
 impl FsVerityGenerator {
-    #[cfg(test)]
     fn generate(data: &[u8], merkle_tree_offset: u64) -> Result<FsVerityOutput, SignError> {
         Self::generate_pieces(data.len(), merkle_tree_offset, |push| {
             push(data);
@@ -447,6 +1041,29 @@ impl FsVerityDescriptor {
         output.extend_from_slice(&self.merkle_tree_offset.to_le_bytes());
         output.resize(FS_VERITY_DESCRIPTOR_SIZE, 0);
         output
+    }
+
+    fn to_bytes(&self, signature_len: usize) -> Result<Vec<u8>, SignError> {
+        let signature_len = u32::try_from(signature_len).map_err(|_| {
+            SignError::SigningFailed("ELF code-sign signature is too large".to_owned())
+        })?;
+        let mut output = Vec::with_capacity(FS_VERITY_DESCRIPTOR_SIZE);
+        output.push(1);
+        output.push(FS_VERITY_HASH_ALGORITHM_SHA256);
+        output.push(FS_VERITY_LOG2_BLOCK_SIZE);
+        output.push(0);
+        output.extend_from_slice(&signature_len.to_le_bytes());
+        output.extend_from_slice(&self.file_size.to_le_bytes());
+        output.extend_from_slice(&self.root_hash);
+        output.resize(output.len() + (64 - DIGEST_SIZE), 0);
+        output.resize(output.len() + 32, 0);
+        output.extend_from_slice(&self.flags.to_le_bytes());
+        output.extend_from_slice(&0u32.to_le_bytes());
+        output.extend_from_slice(&self.merkle_tree_offset.to_le_bytes());
+        output.extend_from_slice(&0u64.to_le_bytes());
+        output.resize(FS_VERITY_DESCRIPTOR_SIZE - 1, 0);
+        output.push(1);
+        Ok(output)
     }
 }
 
