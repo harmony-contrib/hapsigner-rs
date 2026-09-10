@@ -137,3 +137,98 @@ profile with the official tool and the official HAP/ELF with Rust. The binary
 headers, block structure, digest algorithm, exported profile, and code-sign
 verification results match; signature bytes and signing time remain naturally
 non-deterministic.
+
+## Certificate construction
+
+The `generate-*` commands reproduce `CertBuilder`, `CertTools`, and
+`SignToolServiceImpl` rather than textbook PKI, so their output is
+interchangeable with the official tool. Extensions are emitted in the order
+`CertBuilder` adds them, which is the order the official certificates carry:
+
+| Position | Extension | Criticality |
+| --- | --- | --- |
+| 1 | `subjectKeyIdentifier` | never (added in the `CertBuilder` constructor) |
+| 2 | `authorityKeyIdentifier` | never; **only** for a subordinate CA |
+| 3 | `basicConstraints` | per level (see below) |
+| 4 | `keyUsage` | per command |
+| 5 | `extendedKeyUsage` | per command; omitted entirely by `generate-ca` |
+| 6 | signing capability `1.3.6.1.4.1.2011.2.376.1.3` | never; `generate-app-cert` and `generate-profile-cert` only |
+
+`withAuthorityKeyIdentifier` is a no-op for every `CertLevel` except `SUB_CA`,
+so root CA certificates, `generate-cert` output, and end-entity certificates
+carry no authority key identifier at all; the key identifier is the SHA-1 of
+the subject public key bits (RFC 5280 method 1), and a sub CA's is taken from
+the *issuer*.
+
+The signing-capability extension value is the raw DER
+`30 06 02 01 01 0A 01 00` for application certificates and
+`30 06 02 01 01 0A 01 01` for profile certificates.
+
+`basicConstraints` follows `BasicConstraints(int pathLenConstraint)`, which sets
+`CA:TRUE` implicitly, and `LocalizationAdapter` never produces a null path
+length because it boxes a primitive `int`. The observable consequences are:
+
+- a root or subordinate CA, and `generate-cert`, always report `CA:TRUE`;
+- `generate-cert` reports `pathLenConstraint` `0` unless
+  `-basicConstraintsPathLen` is given, so `-basicConstraintsCa false` has no
+  effect;
+- end-entity certificates carry a bare, non-critical sequence, which reads back
+  as `CA:FALSE` with no path length.
+
+Validity defaults are 3650 days for `generate-ca` and 1095 days for
+`generate-cert`, `generate-app-cert`, and `generate-profile-cert`. Serial
+numbers are positive 32-bit integers drawn from the platform CSPRNG.
+
+Distinguished names use `CertUtils.buildDN`'s `X=xx,XX=xxx` grammar. Components
+keep the order they were written in, because BouncyCastle's `X500Name(String)`
+does not apply RFC 4514's most-specific-first convention. Attribute values are
+`PrintableString` for `C` and `serialNumber`, `IA5String` for `DC`, and
+`UTF8String` otherwise. The `CertReqInfo` this produces is byte-identical to
+the official tool's for the same input.
+
+PEM output uses 64-character lines and LF endings. Certification requests carry
+the legacy `NEW CERTIFICATE REQUEST` label that `CertUtils.toCsrTemplate`
+emits, not the modern `CERTIFICATE REQUEST` one.
+
+## Keystore format
+
+The container is chosen from the file extension, as
+`KeyStoreHelper.createKeyStoreAccordingFileType` and `FileUtils.validFileType`
+do: `.jks` selects JKS, `.p12` (and `.pfx`) select PKCS#12. JKS private keys use
+Oracle's proprietary `KeyProtector` scheme with a 20-byte salt drawn from the
+platform CSPRNG; the Rust `jks` dependency's `rand` feature is required for
+this and is why it is enabled. Java's six-character minimum applies to the
+store password only, so a short or empty key password is allowed.
+
+PKCS#12 output is a PFX with a single unencrypted `AuthenticatedSafe` holding a
+shrouded key bag and one certificate bag per chain entry. Each bag carries
+`friendlyName` and `localKeyId` attributes so Java tooling can associate the
+key with its chain. The key is protected with PBES2 using PBKDF2-HMAC-SHA256
+and AES-256-CBC, and the archive integrity check is an HMAC-SHA256 `MacData`
+over the `AuthenticatedSafe` octets, with 10000 iterations.
+
+The MAC's `digestAlgorithm` is the plain `sha256` OID `2.16.840.1.101.3.4.2.1`
+with an explicit NULL, which is what the JDK writes for `HmacPBESHA256`.
+Using the parallel `hmacWithSHA256` OID `1.2.840.113549.2.9` instead makes
+`keytool` reject the file with `Algorithm HmacPBEHMACSHA256 not available`.
+
+Both formats and the generated certificates are verified against JDK 17: the
+official `hap-sign-tool.jar` reads the Rust keystores, issues certificates
+using them, and verifies a HAP signed with a certificate chain produced here.
+
+## Generation divergences
+
+Three behaviours differ from the official tool deliberately:
+
+- **A keystore file is never merged.** The official `KeyStoreHelper.store`
+  opens an existing keystore, adds the entry, and writes it back without a
+  temporary file. This crate refuses to replace an existing keystore without
+  `--force`, because merging into a populated PKCS#12 archive is not
+  implemented. `generate-ca`, which auto-creates its key, therefore only
+  creates a keystore when the file does not exist yet.
+- **`generate-ca` rejects `--issuer` without `--issuer-key-alias`.** Upstream
+  takes the root-CA path in that case and signs a certificate whose issuer name
+  differs from its own subject with the same key, producing an identity that
+  cannot validate.
+- **CA certificate files may use `.pem` or `.crt`.** Upstream accepts `.cer`
+  only, which rejects correctly encoded chains for no benefit.

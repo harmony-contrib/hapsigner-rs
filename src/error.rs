@@ -8,6 +8,43 @@ pub enum SignError {
     #[error("signing material '{0}' must not be empty")]
     EmptyMaterial(&'static str),
 
+    // Key / certificate generation errors
+    #[error("unsupported key algorithm '{0}'; expected RSA or ECC")]
+    UnsupportedKeyAlgorithm(String),
+
+    #[error("key algorithm '{algorithm}' does not support size '{size}'")]
+    UnsupportedKeySize { algorithm: String, size: String },
+
+    #[error("key size '{0}' must be an integer of at most 10 digits")]
+    InvalidKeySize(String),
+
+    #[error("key alias '{alias}' already exists in {path} and cannot be overwritten")]
+    KeyAliasExists { alias: String, path: String },
+
+    #[error("distinguished name '{0}' must use the \"X=xx,XX=xxx\" form")]
+    InvalidDistinguishedName(String),
+
+    #[error("certificate generation failed: {0}")]
+    CertificateBuild(String),
+
+    #[error("PKCS#10 request generation failed: {0}")]
+    CertificateRequestBuild(String),
+
+    #[error("keystore format for '{0}' must be .jks, .p12, or .pfx")]
+    UnsupportedKeystoreFormat(String),
+
+    #[error("keystore write failed: {0}")]
+    KeystoreWrite(String),
+
+    #[error("unsupported key usage or extended key usage value '{0}'")]
+    UnsupportedKeyUsage(String),
+
+    #[error("parameter '{parameter}' is required for {command}")]
+    MissingParameter {
+        command: &'static str,
+        parameter: &'static str,
+    },
+
     // ZIP errors
     #[error("invalid ZIP file: {0}")]
     InvalidZip(&'static str),

@@ -11,10 +11,14 @@ use der::{Decode, EncodePem};
 use hapsigner::{
     ApplicationVerifier, DevelopmentProfileOptions, DevelopmentSigner, FileSigningMaterial,
     HapSigner, InputFormat, ProfileSigner, ProfileVerifier, SignError, SignOptions,
-    SigningAlgorithm, SigningBlockInspector, SigningKey, SigningMaterial,
+    SigningAlgorithm, SigningBlockInspector, SigningCapability, SigningKey, SigningMaterial,
 };
 use tempfile::NamedTempFile;
 use x509_cert::Certificate;
+
+mod cli_pki;
+
+use cli_pki::{CaArgs, CertificateArgs, CsrArgs, EndCertificateArgs, KeyPairArgs};
 
 const STORE_PASSWORD_ENV: &str = "HAPSIGNER_STORE_PASSWORD";
 const KEY_PASSWORD_ENV: &str = "HAPSIGNER_KEY_PASSWORD";
@@ -128,6 +132,24 @@ enum Command {
     },
     /// Print signing-block metadata and the embedded provisioning profile.
     Inspect { input: PathBuf },
+    /// Create a key pair inside a JKS or PKCS#12 keystore.
+    #[command(name = "generate-keypair")]
+    GenerateKeyPair(KeyPairArgs),
+    /// Emit a PKCS#10 certification request for an existing key.
+    #[command(name = "generate-csr")]
+    GenerateCsr(CsrArgs),
+    /// Issue a certificate with full control over its extensions.
+    #[command(name = "generate-cert")]
+    GenerateCert(CertificateArgs),
+    /// Create a root or subordinate CA certificate.
+    #[command(name = "generate-ca")]
+    GenerateCa(CaArgs),
+    /// Issue an application-signing certificate.
+    #[command(name = "generate-app-cert")]
+    GenerateAppCert(EndCertificateArgs),
+    /// Issue a provisioning-profile-signing certificate.
+    #[command(name = "generate-profile-cert")]
+    GenerateProfileCert(EndCertificateArgs),
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -180,11 +202,30 @@ impl From<AppInputFormat> for InputFormat {
     }
 }
 
-struct OutputPolicy {
+pub(crate) struct OutputPolicy {
     force: bool,
 }
 
 impl OutputPolicy {
+    pub(crate) fn new(force: bool) -> Self {
+        Self { force }
+    }
+
+    /// Refuse to replace an existing file unless `--force` was given.
+    pub(crate) fn validate_new(&self, output: &Path) -> Result<()> {
+        if output
+            .try_exists()
+            .with_context(|| format!("failed to inspect output path {}", output.display()))?
+            && !self.force
+        {
+            bail!(
+                "output already exists (pass --force to replace it): {}",
+                output.display()
+            );
+        }
+        Ok(())
+    }
+
     fn validate(&self, input: &Path, output: &Path) -> Result<()> {
         if output
             .try_exists()
@@ -230,10 +271,10 @@ struct EnvironmentPasswords {
     key: String,
 }
 
-struct AtomicOutput;
+pub(crate) struct AtomicOutput;
 
 impl AtomicOutput {
-    fn write(path: &Path, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn write(path: &Path, bytes: &[u8]) -> Result<()> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -473,6 +514,16 @@ fn main() -> Result<()> {
             } else {
                 println!("{}", String::from_utf8(result)?);
             }
+        }
+        Command::GenerateKeyPair(args) => cli_pki::run_generate_keypair(&args)?,
+        Command::GenerateCsr(args) => cli_pki::run_generate_csr(&args)?,
+        Command::GenerateCert(args) => cli_pki::run_generate_cert(&args)?,
+        Command::GenerateCa(args) => cli_pki::run_generate_ca(&args)?,
+        Command::GenerateAppCert(args) => {
+            cli_pki::run_generate_end_cert(&args, SigningCapability::Application)?
+        }
+        Command::GenerateProfileCert(args) => {
+            cli_pki::run_generate_end_cert(&args, SigningCapability::Profile)?
         }
         Command::Inspect { input } => {
             let data =

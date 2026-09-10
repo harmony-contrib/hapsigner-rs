@@ -130,6 +130,70 @@ Inspect signing-block metadata and the embedded profile with:
 hap-sign inspect entry-default-signed.hap
 ```
 
+## Certificate and key generation
+
+The six material-producing commands of the official tool are implemented here
+too, so a complete signing identity can be bootstrapped without a Java
+toolchain:
+
+```bash
+export HAPSIGNER_STORE_PASSWORD='123456'
+export HAPSIGNER_KEY_PASSWORD='123456'
+
+# A root CA. If the keystore does not exist, the key and the file are created.
+hap-sign generate-ca \
+  --key-alias root --key-alg ECC --key-size NIST-P-256 \
+  --subject "C=CN,O=OpenHarmony,OU=OpenHarmony Community,CN=Root CA" \
+  --keystore root.p12 --sign-alg SHA256withECDSA \
+  --basic-constraints-path-len 1 --out-file root-ca.pem
+
+# A subordinate CA, signed by the root.
+hap-sign generate-keypair \
+  --key-alias sub --key-alg ECC --key-size NIST-P-256 --keystore sub.p12
+
+hap-sign generate-ca \
+  --key-alias sub --key-alg ECC --key-size NIST-P-256 \
+  --subject "C=CN,O=OpenHarmony,OU=OpenHarmony Community,CN=Application CA" \
+  --issuer "C=CN,O=OpenHarmony,OU=OpenHarmony Community,CN=Root CA" \
+  --issuer-key-alias root --issuer-keystore root.p12 \
+  --keystore sub.p12 --out-file sub-ca.pem
+
+# An application certificate, emitted as the official leaf/sub-CA/root chain.
+hap-sign generate-keypair \
+  --key-alias app --key-alg ECC --key-size NIST-P-256 --keystore app.p12
+
+hap-sign generate-app-cert \
+  --key-alias app \
+  --subject "C=CN,O=OpenHarmony,OU=OpenHarmony Community,CN=App1 Release" \
+  --issuer "C=CN,O=OpenHarmony,OU=OpenHarmony Community,CN=Application CA" \
+  --issuer-key-alias sub --issuer-keystore sub.p12 \
+  --keystore app.p12 --out-form certChain \
+  --sub-ca-cert-file sub-ca.pem --root-ca-cert-file root-ca.pem \
+  --out-file app-cert-chain.pem
+```
+
+`generate-profile-cert` takes the same options and stamps the profile signing
+capability instead of the application one. `generate-cert` issues a certificate
+with explicit `--key-usage`, `--ext-key-usage`, and `--basic-constraints-*`
+control, and `generate-csr` emits the legacy
+`-----BEGIN NEW CERTIFICATE REQUEST-----` PEM.
+
+Every flag has the official camelCase spelling as a visible alias
+(`--keyAlias`, `--keystoreFile`, `--outForm`), so a command copied from the
+upstream documentation only needs a second leading dash.
+
+Passwords are read from the flag first and from the environment second:
+`HAPSIGNER_STORE_PASSWORD` and `HAPSIGNER_KEY_PASSWORD`, plus
+`HAPSIGNER_ISSUER_STORE_PASSWORD` and `HAPSIGNER_ISSUER_KEY_PASSWORD` for a
+separate `--issuer-keystore`. When the issuer keystore is the caller's own, both
+fall back to the primary passwords, so a shared password is supplied once. An
+absent key password means an empty one, matching the official tool.
+
+The same capability is available as a library. `generate_key_pair`,
+`parse_distinguished_name`, `build_certificate`, `write_keystore`, and the
+`cert_tools` functions accept caller-resolved inputs and return bytes, with no
+filesystem or environment access.
+
 > [!WARNING]
 > The development adapter's embedded OpenHarmony credentials are public test
 > keys. They are only for QEMU and local development, never production,
@@ -148,6 +212,18 @@ hap-sign inspect entry-default-signed.hap
 - `verify-app` deliberately reports a typed unsupported result for BIN because
   official 6.1.1.280 routes BIN verification through `VerifyElf` and rejects
   its own `hw signed app` header.
+- `generate-*` never rewrites a populated keystore. The official tool merges a
+  new entry into an existing file; this tool refuses to replace one without
+  `--force`, because it does not merge entries. Run `generate-keypair` per
+  alias instead. The same applies to `generate-ca`, which only creates a
+  keystore when none exists yet.
+- Passwords never have to appear in the process arguments; the official
+  `-keystorePwd`/`-keyPwd` flags are accepted alongside `HAPSIGNER_*`.
+- `generate-ca` rejects `--issuer` without `--issuer-key-alias`, and
+  `generate-app-cert`/`generate-profile-cert` accept `.pem` as well as `.cer`
+  for the CA certificate files. Both relax cases where the official tool would
+  either emit a self-inconsistent self-signed certificate or reject a
+  correctly-named file.
 - HAR project orchestration, project configuration discovery, remote transport,
   and DevEco password-store decryption are intentionally outside this crate.
 
