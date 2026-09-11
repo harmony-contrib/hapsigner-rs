@@ -114,7 +114,11 @@ impl CertificateSignatureAlgorithm {
         };
         AlgorithmIdentifierOwned {
             oid,
-            parameters: Some(der::Any::from(der::asn1::Null)).filter(|_| !self.is_ecdsa()),
+            parameters: if self.is_ecdsa() {
+                None
+            } else {
+                Some(der::Any::from(der::asn1::Null))
+            },
         }
     }
 
