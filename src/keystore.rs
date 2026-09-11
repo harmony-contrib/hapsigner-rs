@@ -596,41 +596,38 @@ impl SigningKey {
         let mut cert_chain: Vec<Vec<u8>> = Vec::new();
 
         for content_info in &auth_safes {
-            let safe_contents_bytes: Vec<u8>;
-
-            if content_info.content_type == ID_DATA {
-                // Plain safe bag — content is OCTET STRING(SafeContents)
-                let os_der = content_info.content.to_der().map_err(|e| {
-                    SignError::KeystoreParseError(format!("plain safe to_der: {e}"))
-                })?;
-                let os = OctetString::from_der(&os_der).map_err(|e| {
-                    SignError::KeystoreParseError(format!("plain safe OctetString: {e}"))
-                })?;
-                safe_contents_bytes = os.as_bytes().to_vec();
-            } else if content_info.content_type == ID_ENCRYPTED_DATA {
-                // Encrypted safe bag — decrypt with PBES2 then parse SafeContents.
-                let enc_der = content_info
-                    .content
-                    .to_der()
-                    .map_err(|e| SignError::KeystoreParseError(format!("enc safe to_der: {e}")))?;
-                let enc_data = EncryptedData::from_der(&enc_der).map_err(|e| {
-                    SignError::KeystoreParseError(format!("EncryptedData parse: {e}"))
-                })?;
-
-                let params_der = enc_data
-                    .enc_content_info
-                    .content_enc_alg
-                    .parameters
-                    .as_ref()
-                    .ok_or_else(|| {
-                        SignError::KeystoreParseError("missing PBES2 parameters".into())
-                    })?
-                    .to_der()
-                    .map_err(|e| {
-                        SignError::KeystoreParseError(format!("PBES2 params to_der: {e}"))
+            let safe_contents_bytes =
+                if content_info.content_type == ID_DATA {
+                    // Plain safe bag — content is OCTET STRING(SafeContents)
+                    let os_der = content_info.content.to_der().map_err(|e| {
+                        SignError::KeystoreParseError(format!("plain safe to_der: {e}"))
                     })?;
-                let algorithm_der =
-                    enc_data
+                    let os = OctetString::from_der(&os_der).map_err(|e| {
+                        SignError::KeystoreParseError(format!("plain safe OctetString: {e}"))
+                    })?;
+                    os.as_bytes().to_vec()
+                } else if content_info.content_type == ID_ENCRYPTED_DATA {
+                    // Encrypted safe bag — decrypt with PBES2 then parse SafeContents.
+                    let enc_der = content_info.content.to_der().map_err(|e| {
+                        SignError::KeystoreParseError(format!("enc safe to_der: {e}"))
+                    })?;
+                    let enc_data = EncryptedData::from_der(&enc_der).map_err(|e| {
+                        SignError::KeystoreParseError(format!("EncryptedData parse: {e}"))
+                    })?;
+
+                    let params_der = enc_data
+                        .enc_content_info
+                        .content_enc_alg
+                        .parameters
+                        .as_ref()
+                        .ok_or_else(|| {
+                            SignError::KeystoreParseError("missing PBES2 parameters".into())
+                        })?
+                        .to_der()
+                        .map_err(|e| {
+                            SignError::KeystoreParseError(format!("PBES2 params to_der: {e}"))
+                        })?;
+                    let algorithm_der = enc_data
                         .enc_content_info
                         .content_enc_alg
                         .to_der()
@@ -640,36 +637,36 @@ impl SigningKey {
                             ))
                         })?;
 
-                let enc_os = enc_data.enc_content_info.encrypted_content.ok_or_else(|| {
-                    SignError::KeystoreParseError("missing encrypted content".into())
-                })?;
+                    let enc_os = enc_data.enc_content_info.encrypted_content.ok_or_else(|| {
+                        SignError::KeystoreParseError("missing encrypted content".into())
+                    })?;
 
-                let original_ct = enc_os.as_bytes().to_vec();
+                    let original_ct = enc_os.as_bytes().to_vec();
 
-                // Try store_password first; retry with key_password on failure.
-                let decrypted = Self::decrypt_pkcs12_encryption(
-                    &algorithm_der,
-                    &params_der,
-                    store_password,
-                    &original_ct,
-                )
-                .or_else(|_| {
-                    Self::decrypt_pkcs12_encryption(
+                    // Try store_password first; retry with key_password on failure.
+                    let decrypted = Self::decrypt_pkcs12_encryption(
                         &algorithm_der,
                         &params_der,
-                        key_password,
+                        store_password,
                         &original_ct,
                     )
-                })
-                .map_err(|e| {
-                    SignError::KeystoreParseError(format!("encrypted-safe decrypt: {e}"))
-                })?;
+                    .or_else(|_| {
+                        Self::decrypt_pkcs12_encryption(
+                            &algorithm_der,
+                            &params_der,
+                            key_password,
+                            &original_ct,
+                        )
+                    })
+                    .map_err(|e| {
+                        SignError::KeystoreParseError(format!("encrypted-safe decrypt: {e}"))
+                    })?;
 
-                safe_contents_bytes = decrypted;
-            } else {
-                // Skip envelope types we don't handle.
-                continue;
-            }
+                    decrypted
+                } else {
+                    // Skip envelope types we don't handle.
+                    continue;
+                };
 
             // ── 4. Parse SafeContents and collect key + certs ───────────────
             let safe_bags = SafeContents::from_der(&safe_contents_bytes)
