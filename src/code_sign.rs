@@ -1,6 +1,7 @@
 use crate::profile_content::ProfileContent;
 use crate::remote::SigningIdentity;
 use crate::{pkcs7, signing_block, zip::HapZip, SignError, SigningBlockInfo};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -303,25 +304,35 @@ impl<'a> CodeSignBlockBuilder<'a> {
         &self,
         signed_data_builder: &pkcs7::CodeSignSignedDataBuilder,
     ) -> Result<Vec<(String, SignInfo)>, SignError> {
-        let entries = self
+        // Indexed collection preserves archive order, including which error is returned.
+        // Each ZIP read opens its own file range/decoder; only immutable metadata is shared.
+        let prepared = self
             .hap_zip
             .native_entry_names()
-            .into_iter()
+            .into_par_iter()
             .map(|name| {
                 let data_size = self.hap_zip.uncompressed_entry_size(&name)?;
                 let fsverity = FsVerityGenerator::generate_pieces(data_size, 0, |push| {
                     self.hap_zip
                         .try_for_each_uncompressed_entry_piece(&name, push)
                 })?;
+                Ok::<_, SignError>((name, data_size, fsverity.digest))
+            })
+            .collect::<Vec<_>>();
+        // CMS uses immutable local keys and per-call RSA OsRng, but ExternalSigner
+        // may be stateful. Preserve its original callback order (docs/openharmony-format.md).
+        let mut signed = prepared
+            .into_iter()
+            .map(|prepared| {
+                let (name, data_size, digest) = prepared?;
                 let signature = self.sign_fsverity_digest(
                     signed_data_builder,
-                    &fsverity.digest,
+                    &digest,
                     self.owner_id.as_deref(),
                 )?;
-                Ok::<_, SignError>((name, SignInfo::new(0, data_size as u64, signature)))
+                Ok((name, SignInfo::new(0, data_size as u64, signature)))
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut signed = entries;
+            .collect::<Result<Vec<_>, SignError>>()?;
         signed.extend(self.hnp_sign_infos(signed_data_builder)?);
         Ok(signed)
     }
@@ -349,27 +360,30 @@ impl<'a> CodeSignBlockBuilder<'a> {
                 name: entry.name.clone(),
                 message: error.to_string(),
             })?;
-            let signed_entries = hnp
+            let prepared = hnp
                 .entries
-                .iter()
+                .par_iter()
                 .map(|inner_entry| {
                     let data = hnp.read_uncompressed_entry(&inner_entry.name)?;
                     if !data.starts_with(b"\x7fELF") {
                         return Ok(None);
                     }
                     let fsverity = FsVerityGenerator::generate(&data, 0)?;
-                    let signature =
-                        self.sign_fsverity_digest(signed_data_builder, &fsverity.digest, owner_id)?;
                     Ok::<_, SignError>(Some((
                         format!("{}!/{}", entry.name, inner_entry.name),
-                        SignInfo::new(0, data.len() as u64, signature),
+                        data.len(),
+                        fsverity.digest,
                     )))
                 })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
                 .collect::<Vec<_>>();
-            result.extend(signed_entries);
+            // Keep package and inner-entry order, including errors and signer calls.
+            for prepared in prepared {
+                if let Some((name, data_size, digest)) = prepared? {
+                    let signature =
+                        self.sign_fsverity_digest(signed_data_builder, &digest, owner_id)?;
+                    result.push((name, SignInfo::new(0, data_size as u64, signature)));
+                }
+            }
         }
         Ok(result)
     }
@@ -984,10 +998,7 @@ impl MerkleTree {
         }
 
         let mut levels = vec![leaf];
-        loop {
-            let Some(level) = levels.last() else {
-                break;
-            };
+        while let Some(level) = levels.last() {
             if level.len() <= PAGE_SIZE {
                 break;
             }
