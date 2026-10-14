@@ -90,7 +90,9 @@ fs-verity Merkle/sign-info structures follow the hapsigner layout. Native
 library and HNP code-sign records are emitted in archive order. Signing
 callbacks are deliberately sequential because the official `ISigner` provider
 is allowed to be stateful; parallel callback invocation would not preserve its
-observable behavior.
+observable behavior. Native-entry inflation and fs-verity calculation run in
+parallel with independent file handles/decoders. Indexed results are consumed
+in archive order before invoking the signer, including first-error selection.
 
 File-backed ABC/page-info and fs-verity inputs are fed incrementally. Merkle
 levels are retained only when the HAP code-sign block must serialize them;

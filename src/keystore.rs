@@ -644,7 +644,7 @@ impl SigningKey {
                     let original_ct = enc_os.as_bytes().to_vec();
 
                     // Try store_password first; retry with key_password on failure.
-                    let decrypted = Self::decrypt_pkcs12_encryption(
+                    Self::decrypt_pkcs12_encryption(
                         &algorithm_der,
                         &params_der,
                         store_password,
@@ -660,9 +660,7 @@ impl SigningKey {
                     })
                     .map_err(|e| {
                         SignError::KeystoreParseError(format!("encrypted-safe decrypt: {e}"))
-                    })?;
-
-                    decrypted
+                    })?
                 } else {
                     // Skip envelope types we don't handle.
                     continue;

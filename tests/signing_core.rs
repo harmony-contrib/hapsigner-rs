@@ -621,35 +621,49 @@ fn elf64_with_executable_segment(fill: u8) -> Vec<u8> {
 }
 
 fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    fixture_zip(entries, false)
+}
+
+fn fixture_zip(entries: &[(&str, &[u8])], deflate: bool) -> Vec<u8> {
+    use std::io::Write;
     let mut zip = Vec::new();
     let mut central_directory = Vec::new();
     for (name, content) in entries {
+        let method: u16 = if deflate { 8 } else { 0 };
+        let compressed = if deflate {
+            let mut encoder =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(content).expect("deflate fixture");
+            encoder.finish().expect("finish fixture")
+        } else {
+            content.to_vec()
+        };
         let name = name.as_bytes();
         let crc = crc32fast::hash(content);
         let local_offset = zip.len() as u32;
         zip.extend_from_slice(b"PK\x03\x04");
         zip.extend_from_slice(&20u16.to_le_bytes());
         zip.extend_from_slice(&0u16.to_le_bytes());
-        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&method.to_le_bytes());
         zip.extend_from_slice(&0u16.to_le_bytes());
         zip.extend_from_slice(&0u16.to_le_bytes());
         zip.extend_from_slice(&crc.to_le_bytes());
-        zip.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         zip.extend_from_slice(&(content.len() as u32).to_le_bytes());
         zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
         zip.extend_from_slice(&0u16.to_le_bytes());
         zip.extend_from_slice(name);
-        zip.extend_from_slice(content);
+        zip.extend_from_slice(&compressed);
 
         central_directory.extend_from_slice(b"PK\x01\x02");
         central_directory.extend_from_slice(&20u16.to_le_bytes());
         central_directory.extend_from_slice(&20u16.to_le_bytes());
         central_directory.extend_from_slice(&0u16.to_le_bytes());
-        central_directory.extend_from_slice(&0u16.to_le_bytes());
+        central_directory.extend_from_slice(&method.to_le_bytes());
         central_directory.extend_from_slice(&0u16.to_le_bytes());
         central_directory.extend_from_slice(&0u16.to_le_bytes());
         central_directory.extend_from_slice(&crc.to_le_bytes());
-        central_directory.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        central_directory.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         central_directory.extend_from_slice(&(content.len() as u32).to_le_bytes());
         central_directory.extend_from_slice(&(name.len() as u16).to_le_bytes());
         central_directory.extend_from_slice(&0u16.to_le_bytes());
@@ -712,4 +726,181 @@ impl ExternalSigner for TestExternalSigner {
     fn certificates(&self) -> Result<Vec<Vec<u8>>, SignError> {
         Ok(self.certificates.clone())
     }
+}
+
+// Generated in archive order by the published 0.2.0 sequential implementation.
+// RSA has fixed signature lengths, so normalizing only signatures/signingTime
+// leaves every offset, length, digest, certificate and segment byte comparable.
+#[test]
+fn native_code_sign_layout_matches_sequential_fixture_with_one_and_four_workers() {
+    let fixture = include_bytes!("fixtures/test.p12");
+    let source = SigningKey::from_pkcs12(fixture, "test123", "1", "test123").unwrap();
+    let profile = DevelopmentMaterialBuilder::new(development_profile("com.example.parallel"))
+        .build()
+        .unwrap()
+        .signed_profile()
+        .to_vec();
+    let material = SigningMaterial::from_der(
+        source.private_key_der.clone(),
+        source.cert_chain.clone(),
+        profile,
+        SigningAlgorithm::RsaPssSha256,
+    )
+    .unwrap();
+    let signer = HapSigner::new(material, SignOptions::default());
+    let temp = tempfile::tempdir().unwrap();
+    let mut libs = [
+        elf64_with_executable_segment(0x11),
+        elf64_with_executable_segment(0x22),
+        elf64_with_executable_segment(0x33),
+    ];
+    // Read-only segments avoid timestamped .pages.info generation in the golden fixture.
+    for lib in &mut libs {
+        lib[68..72].copy_from_slice(&4u32.to_le_bytes());
+    }
+    let hnp = fixture_zip(
+        &[
+            ("bin/z-last", &libs[2]),
+            ("README", b"not ELF"),
+            ("bin/a-first", &libs[0]),
+            ("lib/middle.so", &libs[1]),
+        ],
+        true,
+    );
+    let module = br#"{"module":{"hnpPackages":[{"package":"sample.hnp","type":"public"}]}}"#;
+    for deflate in [false, true] {
+        let unsigned = fixture_zip(
+            &[
+                ("module.json", module),
+                ("libs/arm64-v8a/libz.so", &libs[2]),
+                ("libs/arm64-v8a/liba.so", &libs[0]),
+                ("libs/arm64-v8a/libm.so", &libs[1]),
+                ("hnp/arm64-v8a/sample.hnp", &hnp),
+            ],
+            deflate,
+        );
+        let input = temp.path().join("unsigned.hap");
+        std::fs::write(&input, &unsigned).unwrap();
+        let mut reference = None;
+        for workers in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            let output = temp.path().join("signed.hap");
+            let signed = pool.install(|| {
+                signer.sign_file(&input, &output).unwrap();
+                std::fs::read(&output).unwrap()
+            });
+            ApplicationVerifier::new(&signed)
+                .verify(InputFormat::Zip)
+                .unwrap();
+            let normalized = normalized_code_sign_property(&signed);
+            if let Some(reference) = &reference {
+                assert_eq!(&normalized, reference);
+            } else {
+                reference = Some(normalized.clone());
+            }
+            let expected: &[u8] = if deflate {
+                include_bytes!("fixtures/native-code-sign-deflated.bin")
+            } else {
+                include_bytes!("fixtures/native-code-sign-stored.bin")
+            };
+            assert_eq!(normalized, expected);
+            let memory_signed = pool.install(|| signer.sign(&unsigned).unwrap());
+            ApplicationVerifier::new(&memory_signed)
+                .verify(InputFormat::Zip)
+                .unwrap();
+            assert_eq!(normalized, normalized_code_sign_property(&memory_signed));
+        }
+    }
+}
+
+fn normalized_code_sign_property(hap: &[u8]) -> Vec<u8> {
+    let blocks = SigningBlockInspector::new(hap).inspect().unwrap();
+    let property = blocks
+        .blocks
+        .iter()
+        .find(|entry| entry.kind() == SigningBlockType::Property)
+        .unwrap();
+    let mut bytes = hap[property.offset..property.offset + property.length].to_vec();
+    let code = 12;
+    assert_eq!(read_fixture_u32(&bytes, code + 16), 3);
+    let hap_segment = code + read_fixture_u32(&bytes, code + 32 + 12 + 4);
+    normalize_code_sign_cms(&mut bytes, hap_segment + 4);
+    let native = code + read_fixture_u32(&bytes, code + 32 + 24 + 4);
+    let count = read_fixture_u32(&bytes, native + 8);
+    assert_eq!(count, 6);
+    let mut names = Vec::new();
+    for index in 0..count {
+        let row = native + 12 + index * 16;
+        let name_offset = native + read_fixture_u32(&bytes, row);
+        let name_len = read_fixture_u32(&bytes, row + 4);
+        names.push(String::from_utf8(bytes[name_offset..name_offset + name_len].to_vec()).unwrap());
+        let sign_info = native + read_fixture_u32(&bytes, row + 8);
+        normalize_code_sign_cms(&mut bytes, sign_info);
+    }
+    // HAP preparation orders native paths; HNP preserves its inner archive order.
+    assert_eq!(
+        names,
+        [
+            "libs/arm64-v8a/liba.so",
+            "libs/arm64-v8a/libm.so",
+            "libs/arm64-v8a/libz.so",
+            "hnp/arm64-v8a/sample.hnp!/bin/z-last",
+            "hnp/arm64-v8a/sample.hnp!/bin/a-first",
+            "hnp/arm64-v8a/sample.hnp!/lib/middle.so"
+        ]
+    );
+    bytes
+}
+
+fn normalize_code_sign_cms(bytes: &mut [u8], sign_info: usize) {
+    use cms::{
+        content_info::ContentInfo,
+        signed_data::{SignedData, SignerInfos},
+    };
+    use der::{
+        asn1::{Any, OctetString},
+        Decode, Encode,
+    };
+    let length = read_fixture_u32(bytes, sign_info + 4);
+    let signature = &mut bytes[sign_info + 60..sign_info + 60 + length];
+    let mut content = ContentInfo::from_der(signature).unwrap();
+    let mut data = SignedData::from_der(&content.content.to_der().unwrap()).unwrap();
+    let mut signers = Vec::new();
+    for original in data.signer_infos.0.iter() {
+        let mut signer = original.clone();
+        signer.signature = OctetString::new(vec![0; signer.signature.as_bytes().len()]).unwrap();
+        let attrs = signer
+            .signed_attrs
+            .take()
+            .unwrap()
+            .iter()
+            .map(|attr| {
+                let mut attr = attr.clone();
+                if attr.oid.to_string() == "1.2.840.113549.1.9.5" {
+                    attr.values = vec![Any::from_der(b"\x17\x0d260101000000Z").unwrap()]
+                        .try_into()
+                        .unwrap();
+                }
+                attr
+            })
+            .collect::<Vec<_>>();
+        signer.signed_attrs = Some(attrs.try_into().unwrap());
+        signers.push(signer);
+    }
+    data.signer_infos = SignerInfos(signers.try_into().unwrap());
+    content.content = Any::from_der(&data.to_der().unwrap()).unwrap();
+    let normalized = content.to_der().unwrap();
+    assert_eq!(
+        normalized.len(),
+        signature.len(),
+        "normalization preserves offsets and lengths"
+    );
+    signature.copy_from_slice(&normalized);
+}
+
+fn read_fixture_u32(bytes: &[u8], offset: usize) -> usize {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize
 }
