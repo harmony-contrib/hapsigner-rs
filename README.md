@@ -7,9 +7,10 @@ DevEco secrets, or assume an SDK/install path.
 
 The signing pipeline implements HAP signing block V2/V3, CMS/PKCS#7, all
 official SHA-256/384/512 ECDSA and RSA-PSS algorithm names, ZIP alignment,
-page-info generation, and fs-verity code signing for ABC, native-library, HNP,
-and standalone ELF inputs. It loads both JKS and modern or legacy PKCS#12
-keystores. File signing streams archive payloads and fs-verity inputs, then
+page-info generation, fs-verity code signing for ABC, native-library, HNP,
+and standalone ELF inputs, and Hvigor's HAR directory-signing protocol
+(`sdk-sign-tool-full.jar sign-har`). It loads both JKS and modern or legacy
+PKCS#12 keystores. File signing streams archive payloads and fs-verity inputs, then
 atomically replaces the destination, including when input and output are the
 same path.
 
@@ -130,6 +131,66 @@ Inspect signing-block metadata and the embedded profile with:
 hap-sign inspect entry-default-signed.hap
 ```
 
+## HAR directory signing
+
+Hvigor's `PackageSignHar` stages a task directory containing `package/` and
+asks the HarmonyOS SDK directory signer (`sdk-sign-tool-full.jar sign-har`) to
+add `.CodeSignature/` in place. The same protocol is implemented natively, so
+the HAR path no longer needs a Java runtime:
+
+```bash
+export HAPSIGNER_STORE_PASSWORD='store password'
+export HAPSIGNER_KEY_PASSWORD='key password'
+
+hap-sign sign-har \
+  --in-file build/cache/default@PackageSignHar \
+  --keystore signing/debug.p12 \
+  --key-alias debugKey \
+  --certificate signing/debug-app-cert.pem \
+  --profile signing/debug-profile.p7b \
+  --sign-alg SHA256withECDSA
+```
+
+The command replaces any existing `.CodeSignature` and writes `profile` (when
+supplied), `codeFileList`, and `signature`. `verify-har` checks the CMS
+signature, the manifest bytes, and every file digest:
+
+```bash
+hap-sign verify-har \
+  --in-file build/cache/default@PackageSignHar \
+  --out-profile verified-profile.p7b
+```
+
+Library consumers use `HarSigner` and `HarVerifier` directly. Staging
+`package/` and repacking the signed archive remain the caller's responsibility;
+this crate owns only the directory protocol. The manifest is byte-compatible
+with SDK `sdk-dir-signer` 7.0.0.304: compact Gson JSON (`version` 1.0, standard
+Base64 SHA-256 digests), entries sorted by file name, attached CMS content, and
+digest algorithm identifiers without NULL parameters.
+
+```rust,no_run
+use std::path::Path;
+use hapsigner::{HarSigner, HarSigningMaterial, SigningAlgorithm};
+
+fn sign_har(
+    keystore: &[u8],
+    cert_chain: &[u8],
+    profile: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    HarSigner::from_keystore(HarSigningMaterial {
+        keystore,
+        store_password: "store password",
+        key_alias: "debugKey",
+        key_password: "key password",
+        sign_certificate_chain: cert_chain,
+        profile: Some(profile),
+        algorithm: SigningAlgorithm::EcdsaSha256,
+    })?
+    .sign_directory(Path::new("build/cache/default@PackageSignHar"))?;
+    Ok(())
+}
+```
+
 ## Certificate and key generation
 
 The six material-producing commands of the official tool are implemented here
@@ -224,6 +285,9 @@ filesystem or environment access.
   for the CA certificate files. Both relax cases where the official tool would
   either emit a self-inconsistent self-signed certificate or reject a
   correctly-named file.
+- `sign-har`/`verify-har` implement the SDK directory protocol, not Hvigor's
+  project orchestration: staging `package/`, deciding when to sign, and
+  repacking the archive are the caller's job.
 - HAR project orchestration, project configuration discovery, remote transport,
   and DevEco password-store decryption are intentionally outside this crate.
 

@@ -1,4 +1,4 @@
-//! Reusable Java-free OpenHarmony HAP/HSP signing library.
+//! Reusable Java-free OpenHarmony HAP/HSP/HAR signing library.
 //!
 //! The core API accepts caller-provided signing material and has no knowledge
 //! of Hvigor projects or configuration files. The optional development adapter
@@ -15,6 +15,7 @@ pub mod development;
 mod digest;
 mod dn;
 mod error;
+mod har;
 mod inspector;
 mod keypair;
 mod keystore;
@@ -48,6 +49,7 @@ pub use csr::{build_certificate_request, certificate_request_pem, CERTIFICATE_RE
 pub use development::{DevelopmentMaterialBuilder, DevelopmentProfileOptions, DevelopmentSigner};
 pub use dn::parse_distinguished_name;
 pub use error::SignError;
+pub use har::{HarSigner, HarSigningMaterial, HarVerification, HarVerifier};
 pub use inspector::{SigningBlockEntry, SigningBlockInfo, SigningBlockInspector, SigningBlockType};
 pub use keypair::{generate_key_pair, GeneratedKeyPair, KeyAlgorithm, KeySize};
 pub use keystore::SigningKey;

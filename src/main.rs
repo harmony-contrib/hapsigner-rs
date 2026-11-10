@@ -10,8 +10,9 @@ use der::pem::LineEnding;
 use der::{Decode, EncodePem};
 use hapsigner::{
     ApplicationVerifier, DevelopmentProfileOptions, DevelopmentSigner, FileSigningMaterial,
-    HapSigner, InputFormat, ProfileSigner, ProfileVerifier, SignError, SignOptions,
-    SigningAlgorithm, SigningBlockInspector, SigningCapability, SigningKey, SigningMaterial,
+    HapSigner, HarSigner, HarSigningMaterial, HarVerifier, InputFormat, ProfileSigner,
+    ProfileVerifier, SignError, SignOptions, SigningAlgorithm, SigningBlockInspector,
+    SigningCapability, SigningKey, SigningMaterial,
 };
 use tempfile::NamedTempFile;
 use x509_cert::Certificate;
@@ -129,6 +130,42 @@ enum Command {
         input: PathBuf,
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    /// Sign a staged HAR task directory in place (Hvigor `PackageSignHar`).
+    #[command(name = "sign-har")]
+    SignHar {
+        /// Directory containing `package/`; receives `.CodeSignature/`.
+        #[arg(long = "in-file", visible_alias = "inFile")]
+        input: PathBuf,
+        #[arg(long = "keystore", visible_alias = "keystoreFile")]
+        keystore: PathBuf,
+        #[arg(long = "key-alias", visible_alias = "keyAlias")]
+        key_alias: String,
+        /// Certificate chain as official `-signCertFile` (PEM or DER).
+        #[arg(long = "certificate", visible_alias = "signCertFile")]
+        certificate: PathBuf,
+        #[arg(long = "profile", visible_alias = "profileFile")]
+        profile: Option<PathBuf>,
+        #[arg(
+            long = "sign-alg",
+            visible_alias = "signAlg",
+            default_value = "SHA256withECDSA"
+        )]
+        sign_alg: String,
+        #[arg(long = "keystore-pwd", visible_alias = "keystorePwd")]
+        store_password: Option<String>,
+        #[arg(long = "key-pwd", visible_alias = "keyPwd")]
+        key_password: Option<String>,
+    },
+    /// Verify a staged HAR task directory and export its signature material.
+    #[command(name = "verify-har")]
+    VerifyHar {
+        #[arg(long = "in-file", visible_alias = "inFile")]
+        input: PathBuf,
+        #[arg(long)]
+        out_profile: Option<PathBuf>,
+        #[arg(long)]
+        out_cert_chain: Option<PathBuf>,
     },
     /// Print signing-block metadata and the embedded provisioning profile.
     Inspect { input: PathBuf },
@@ -328,6 +365,16 @@ impl EnvironmentPasswords {
     }
 }
 
+/// Prefer an explicit flag, then the matching environment variable.
+fn resolve_secret(value: Option<String>, environment: &str) -> Result<String> {
+    match value {
+        Some(value) => Ok(value),
+        None => std::env::var(environment).with_context(|| {
+            format!("{environment} must be set when the matching flag is omitted")
+        }),
+    }
+}
+
 impl AppFeature {
     fn profile_value(self) -> &'static str {
         match self {
@@ -514,6 +561,54 @@ fn main() -> Result<()> {
             } else {
                 println!("{}", String::from_utf8(result)?);
             }
+        }
+        Command::SignHar {
+            input,
+            keystore,
+            key_alias,
+            certificate,
+            profile,
+            sign_alg,
+            store_password,
+            key_password,
+        } => {
+            let keystore_bytes = fs::read(&keystore)
+                .with_context(|| format!("failed to read {}", keystore.display()))?;
+            let certificate_bytes = fs::read(&certificate)
+                .with_context(|| format!("failed to read {}", certificate.display()))?;
+            let profile_bytes = profile
+                .as_deref()
+                .map(|path| {
+                    fs::read(path).with_context(|| format!("failed to read {}", path.display()))
+                })
+                .transpose()?;
+            let store_password = resolve_secret(store_password, STORE_PASSWORD_ENV)?;
+            let key_password = resolve_secret(key_password, KEY_PASSWORD_ENV)?;
+            let signer = HarSigner::from_keystore(HarSigningMaterial {
+                keystore: &keystore_bytes,
+                store_password: &store_password,
+                key_alias: &key_alias,
+                key_password: &key_password,
+                sign_certificate_chain: &certificate_bytes,
+                profile: profile_bytes.as_deref(),
+                algorithm: SigningAlgorithm::from_str(&sign_alg)?,
+            })?;
+            signer.sign_directory(&input)?;
+            println!("{}", input.display());
+        }
+        Command::VerifyHar {
+            input,
+            out_profile,
+            out_cert_chain,
+        } => {
+            let verified = HarVerifier::verify_directory(&input)?;
+            if let (Some(path), Some(profile)) = (out_profile, verified.profile.as_deref()) {
+                AtomicOutput::write(&path, profile)?;
+            }
+            if let Some(path) = out_cert_chain {
+                VerificationOutput::certificate_chain(&path, &verified.certificates)?;
+            }
+            println!("verify signature success");
         }
         Command::GenerateKeyPair(args) => cli_pki::run_generate_keypair(&args)?,
         Command::GenerateCsr(args) => cli_pki::run_generate_csr(&args)?,

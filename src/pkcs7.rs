@@ -345,8 +345,20 @@ impl Der {
         }
     }
 
+    /// `AlgorithmIdentifier` with explicit NULL parameters.
+    ///
+    /// BC's `RSASSAPSSparams` nests the digest identifier this way. Top-level
+    /// `digestAlgorithm` fields use the absent-parameters form below, matching
+    /// `DefaultDigestAlgorithmIdentifierFinder`.
     fn digest_algorithm_identifier(algorithm: ContentDigestAlgorithm) -> Vec<u8> {
         Der::sequence(&Der::concat(&[Self::digest_oid(algorithm), &[0x05, 0x00]]))
+    }
+
+    /// `AlgorithmIdentifier` with the optional parameters field absent, as
+    /// written by BC's `DefaultDigestAlgorithmIdentifierFinder` for SHA-256,
+    /// SHA-384, and SHA-512.
+    fn digest_algorithm_identifier_absent(algorithm: ContentDigestAlgorithm) -> Vec<u8> {
+        Der::sequence(Self::digest_oid(algorithm))
     }
 
     fn rsa_pss_params(algorithm: ContentDigestAlgorithm) -> Vec<u8> {
@@ -456,11 +468,19 @@ impl CmsSigningContext {
             .map_err(|e| SignError::DerError(format!("serial encode: {e}")))?;
         let issuer_and_serial = Der::sequence(&Der::concat(&[&issuer_der, &serial_der]));
 
-        let mut certs_inner = Vec::new();
-        for cert_der in cert_chain {
-            certs_inner.extend_from_slice(cert_der);
-        }
-        let certificates = Der::implicit_ctx(0, &certs_inner);
+        // CMS carries certificates in a `[0] IMPLICIT SET OF`. DER requires the
+        // set elements to be sorted by their full encodings; the official
+        // generators build a BER/DERSet, so the encoded order is sorted rather
+        // than leaf-first.
+        let mut sorted_certificates = cert_chain.to_vec();
+        sorted_certificates.sort();
+        let certificates_inner = Der::concat(
+            &sorted_certificates
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>(),
+        );
+        let certificates = Der::implicit_ctx(0, &certificates_inner);
 
         let signature_algorithm = match algorithm {
             SigningAlgorithm::RsaPssSha256
@@ -950,6 +970,19 @@ pub(crate) fn build_cms_signed_data_with_identity(
     signer.build_signed_data(content, true, None)
 }
 
+/// Build the attached CMS SignedData used by the SDK directory signer.
+///
+/// `sdk-sign-tool-full.jar sign-har` embeds the `codeFileList` JSON as the
+/// encapsulated content.
+pub(crate) fn build_har_cms_signed_data(
+    content: &[u8],
+    identity: &SigningIdentity,
+    algorithm: SigningAlgorithm,
+) -> Result<Vec<u8>, SignError> {
+    let signer = CmsSigningContext::from_identity(identity, algorithm.id())?;
+    signer.build_signed_data(content, true, None)
+}
+
 fn build_cms_signed_data_internal(
     content: &[u8],
     signer: &CmsSigningContext,
@@ -960,7 +993,8 @@ fn build_cms_signed_data_internal(
     // 1. digestAlgorithms SET
     // -----------------------------------------------------------------------
     let content_digest_algorithm = signer.algorithm.content_digest();
-    let digest_algorithm_identifier = Der::digest_algorithm_identifier(content_digest_algorithm);
+    let digest_algorithm_identifier =
+        Der::digest_algorithm_identifier_absent(content_digest_algorithm);
     let digest_algorithms = Der::set(&digest_algorithm_identifier);
 
     // -----------------------------------------------------------------------
