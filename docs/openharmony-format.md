@@ -37,6 +37,14 @@ produce attached SignedData. Both the provisioning profile and the HAP digest
 message are stored in `encapContentInfo.eContent`. Each `SignerInfo` uses the
 leaf certificate issuer and serial number and contains the PKCS#9
 `contentType`, `signingTime`, and `messageDigest` signed attributes.
+`BcSignedDataGenerator` produces the same structure with detached content for
+code signing.
+
+Top-level `digestAlgorithm` identifiers omit the optional parameters, which is
+what BC's `DefaultDigestAlgorithmIdentifierFinder` emits for SHA-256/384/512.
+The digest identifier nested inside RSA-PSS parameters keeps an explicit NULL.
+Certificate sets are DER-sorted because BC builds a `BERSet` and re-encodes the
+whole `ContentInfo` as DER.
 
 The device verifier's `HapVerifyOpensslUtils::ParsePkcs7Package` requires the
 attached octet string, and `VerifyCertChain` uses `signingTime` when checking
@@ -139,6 +147,60 @@ profile with the official tool and the official HAP/ELF with Rust. The binary
 headers, block structure, digest algorithm, exported profile, and code-sign
 verification results match; signature bytes and signing time remain naturally
 non-deterministic.
+
+## HAR directory signing
+
+Unlike HAP/HSP/HQF, HAR directory signing has no OpenHarmony open-source
+implementation. `developtools_hapsigner` (through `OpenHarmony-v7.0-Release`),
+`security_code_signature`, `developtools_packing_tool`, and `signcenter_tool`
+contain no `sign-har` command, `SdkSigner`, `codeFileList`, or
+`.CodeSignature` protocol. The contract below is therefore observed from the
+closed HarmonyOS SDK artifact `sdk-dir-signer` 7.0.0.304
+(`sdk-sign-tool-full.jar`), whose CMS construction matches the open-source
+`BcPkcs7Generator` / `BcSignedDataGenerator`; the HAR-specific parts are the
+directory layout and the `codeFileList` manifest.
+
+Hvigor `PackageSignHar` does not use the archive-signing commands. It stages a
+directory containing `package/` and calls the SDK directory signer. The
+observed behavior is `SdkSigner.signSdkLocal` in SDK `sdk-dir-signer`
+7.0.0.304:
+
+1. Delete and recreate `<root>/.CodeSignature`.
+2. Copy `-profileFile` to `.CodeSignature/profile` when supplied.
+3. Recursively list every regular file, including `.CodeSignature/profile`,
+   and sort by `File.getName()`.
+4. Write `.CodeSignature/codeFileList` as compact Gson JSON:
+
+   ```json
+   {"version":1.0,"fileInfo":{"digestAlg":"SHA-256","fileList":[{"fileName":"package/index.ets","digest":"..."}]}}
+   ```
+
+   `fileName` is the slash-separated path relative to the canonical root.
+   `digest` is standard Base64 of SHA-256 over the file bytes. Gson's default
+   HTML escaping applies (`<`, `>`, `&`, `=`, and `'` become `\u00xx`).
+   `codeFileList` and `signature` are not part of the list because they are
+   written later.
+5. Write `.CodeSignature/signature`: an attached CMS SignedData over the exact
+   `codeFileList` bytes. Signed attributes are `contentType`, `signingTime`,
+   and `messageDigest`; the signer identifier is issuer-and-serial; the
+   certificate set is the `-signCertFile` chain. Top-level `digestAlgorithm`
+   identifiers omit the optional parameters, matching
+   `DefaultDigestAlgorithmIdentifierFinder`; the digest identifier nested in
+   RSA-PSS parameters keeps its explicit NULL.
+
+`verify-har` and `HarVerifier` mirror `SdkVerifier.verifySdkIntegrity`: verify
+the CMS signature against the embedded certificate, require the attached
+content to equal `codeFileList`, and require the current file set to match the
+manifest one-to-one with matching digests. Trust anchoring against a source
+certificate list is intentionally not applied; callers that need it can
+validate the returned certificate chain themselves.
+
+The Rust implementation and the SDK signer produce byte-identical
+`codeFileList` output for the same staged tree, and each verifies the other's
+signature. Deliberate hardening: entries with identical base names are
+tie-broken by manifest path (Java's order is filesystem-dependent), directory
+symlink cycles are cut instead of recursing, and verification rejects manifest
+paths that are absolute or contain `..`.
 
 ## Certificate construction
 

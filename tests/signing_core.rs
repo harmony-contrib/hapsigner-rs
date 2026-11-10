@@ -806,6 +806,14 @@ fn native_code_sign_layout_matches_sequential_fixture_with_one_and_four_workers(
             } else {
                 include_bytes!("fixtures/native-code-sign-stored.bin")
             };
+            if std::env::var_os("HAPSIGNER_UPDATE_CODE_SIGN_FIXTURES").is_some() {
+                let path = if deflate {
+                    "tests/fixtures/native-code-sign-deflated.bin"
+                } else {
+                    "tests/fixtures/native-code-sign-stored.bin"
+                };
+                std::fs::write(path, &normalized).unwrap();
+            }
             assert_eq!(normalized, expected);
             let memory_signed = pool.install(|| signer.sign(&unsigned).unwrap());
             ApplicationVerifier::new(&memory_signed)

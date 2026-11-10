@@ -3,6 +3,11 @@
 `native-code-sign-stored.bin` and `native-code-sign-deflated.bin` are property
 blocks captured from the published hapsigner 0.2.0 (`ec531c0`) sequential
 `native_sign_infos` / `hnp_sign_infos` implementation, before parallelization.
+They were regenerated on 2026-11-10 when top-level CMS `digestAlgorithm`
+identifiers changed from explicit NULL to absent parameters, matching BC's
+`DefaultDigestAlgorithmIdentifierFinder` and the open-source
+`BcPkcs7Generator` / `BcSignedDataGenerator`. Run the test with
+`HAPSIGNER_UPDATE_CODE_SIGN_FIXTURES=1` to refresh them.
 `native_code_sign_layout_matches_sequential_fixture_with_one_and_four_workers`
 constructs the corresponding HAP inputs and verifies signed outputs, both
 file-backed and memory-backed, with one and four Rayon workers.
