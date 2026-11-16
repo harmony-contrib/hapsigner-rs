@@ -67,6 +67,21 @@ signing.
 
 ## CLI
 
+Install a prebuilt release with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+
+```bash
+cargo binstall hapsigner
+hap-sign --version
+```
+
+The crate is named `hapsigner`; the installed command is `hap-sign`. New
+releases provide x86_64 and ARM64 binaries for Linux (glibc 2.35+), macOS,
+and Windows. Archives and their `.sha256` checksums are attached to
+[GitHub Releases](https://github.com/harmony-contrib/hapsigner-rs/releases).
+Older releases and other targets may fall back to source compilation. Use
+`cargo binstall hapsigner --strategies crate-meta-data` to require a binary
+from this repository.
+
 Install from source:
 
 ```bash
@@ -259,6 +274,21 @@ filesystem or environment access.
 > The development adapter's embedded OpenHarmony credentials are public test
 > keys. They are only for QEMU and local development, never production,
 > AppGallery, or private release signing.
+
+## Releasing
+
+Publish a new crate version with `cargo publish --locked` and push a matching
+`v<version>` tag for the same commit. The published crate must contain the
+`package.metadata.binstall` configuration so `cargo binstall hapsigner` can
+find the release assets.
+
+The [Release workflow](.github/workflows/release.yml) builds all six platform/CPU
+combinations from the tag and verifies each packaged CLI's version and help
+output. After all builds succeed, it verifies the archive checksums, uploads
+the assets, and tests `cargo binstall` against the released manifest and Linux
+binary with source compilation and third-party binary sources disabled.
+The existing `hap-sign-<target>.tar.gz` and `.tar.gz.sha256` asset names remain
+compatible with `install.sh`.
 
 ## Compatibility boundary
 
